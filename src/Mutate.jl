@@ -34,6 +34,7 @@ using ..MutationFunctionsModule:
     break_random_connection!,
     randomly_rotate_tree!,
     randomize_tree
+using ..NeuralMutationsModule: neural_mutate_tree
 using ..ConstantOptimizationModule: optimize_constants
 using ..RecorderModule: @recorder
 
@@ -421,6 +422,20 @@ function mutate!(
 ) where {N<:AbstractExpression,P<:PopMember}
     tree = mutate_constant(tree, temperature, options)
     @recorder recorder["type"] = "mutate_constant"
+    return MutationResult{N,P}(; tree=tree)
+end
+
+function mutate!(
+    tree::N,
+    member::P,
+    ::Val{:neural_mutate_tree},
+    ::AbstractMutationWeights,
+    options::AbstractOptions;
+    recorder::RecordType,
+    kws...,
+) where {N<:AbstractExpression,P<:PopMember}
+    tree = neural_mutate_tree(tree, options)
+    @recorder recorder["type"] = "neural_mutate_tree"
     return MutationResult{N,P}(; tree=tree)
 end
 

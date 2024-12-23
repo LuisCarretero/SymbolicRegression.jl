@@ -211,6 +211,8 @@ using DispatchDoctor: @stable
     include("ConstantOptimization.jl")
     include("Population.jl")
     include("HallOfFame.jl")
+    include("Parsing.jl")
+    include("NeuralMutationsModule.jl")
     include("Mutate.jl")
     include("RegularizedEvolution.jl")
     include("SingleIteration.jl")
@@ -324,6 +326,7 @@ using .TemplateExpressionModule: TemplateExpression, TemplateStructure
 using .TemplateExpressionModule: TemplateExpression, TemplateStructure, ValidVector
 using .ComposableExpressionModule: ComposableExpression
 using .ExpressionBuilderModule: embed_metadata, strip_metadata
+using .NeuralMutationsModule: neural_mutate_tree
 
 @stable default_mode = "disable" begin
     include("deprecates.jl")
