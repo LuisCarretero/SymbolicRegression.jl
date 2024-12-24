@@ -82,18 +82,22 @@ function neural_mutate_tree(
         initialize_config_and_ops(options)
     end
 
-    # Select a viable subtree to mutate
-    subtree, parent, feature = select_subtree(tree)
+    # # Select a viable subtree to mutate
+    found_subtree, subtree, parent, feature = select_subtree(tree)
+    # @info "Found subtree: $found_subtree; subtree: $subtree; parent: $parent; feature: $feature"
+    !found_subtree && return tree
     try
         # Encode the subtree into a one-hot vector
         encode_success, x = node_to_onehot(subtree, CFG_REF[])
+        # @info "Encoded subtree: $encode_success"
         if encode_success
             # Sample new subtree
             input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [0.05])
             raw_out = MODEL_REF[](input)
             x_out = raw_out["276"][1, :, :]
             prods = logits_to_prods(x_out, true)
-            new_subtree = prods_to_tree(prods, OP_INDEX, feature)
+            new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
+            # @info "Created new subtree: $subtree -> $new_subtree"
 
             # Replace the old subtree with the new one
             if parent === nothing
@@ -101,10 +105,13 @@ function neural_mutate_tree(
                 return new_subtree
             else
                 # Replace the appropriate child in the parent node
-                for i in 1:length(parent.children)
-                    if parent.children[i] === subtree
-                        parent.children[i] = new_subtree
-                        break
+                if parent.degree == 1
+                    parent.l = new_subtree
+                elseif parent.degree == 2
+                    if parent.l === subtree
+                        parent.l = new_subtree
+                    else
+                        parent.r = new_subtree
                     end
                 end
                 return tree
@@ -113,6 +120,7 @@ function neural_mutate_tree(
             return tree
         end
     catch e
+        # @error "Error in neural_mutate_tree: $e"
         return tree
     end
 end

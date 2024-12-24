@@ -263,7 +263,7 @@ Copied from datagen/ExpressionGenerator.jl. Consolidate.
 function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Node{T} where {T<:Number}
     function build_subtree()
         if isempty(prefix_list)
-            error("Unexpected end of prefix list")
+            error("Prefix_to_tree: Unexpected end of prefix list")
         end
         node = popfirst!(prefix_list)
         if node.degree == 0
@@ -274,13 +274,13 @@ function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Node{T} where {T<:Numbe
             node.l = build_subtree()
             node.r = build_subtree()
         else
-            error("Invalid node degree: $(node.degree)")
+            error("Prefix_to_tree: Invalid node degree: $(node.degree)")
         end
         return node
     end
 
     if isempty(prefix_list)
-        error("Empty prefix list")
+        error("Prefix_to_tree: Empty prefix list")
     end
     return build_subtree()
 end
@@ -294,7 +294,7 @@ Returns the subtree and the feature used in the subtree.
 
 FIXME: Make stochastic.
 """
-function select_subtree(t::Node)::Tuple{Node, Node, Int}
+function select_subtree(t::Node)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
     node_list = _tree_to_prefix(t)
 
     valid_subtrees = []
@@ -314,12 +314,11 @@ function select_subtree(t::Node)::Tuple{Node, Node, Int}
             end
         end
         
-        # Check univariate constraint
         if length(features_used) == 1
             # Find parent node
             parent = nothing
             for potential_parent in node_list
-                if potential_parent.l === node || potential_parent.r === node
+                if (isdefined(potential_parent, :l) && potential_parent.l === node) || (isdefined(potential_parent, :r) && potential_parent.r === node)
                     parent = potential_parent
                     break
                 end
@@ -329,10 +328,11 @@ function select_subtree(t::Node)::Tuple{Node, Node, Int}
     end
 
     if isempty(valid_subtrees)
-        return nothing
+        return (false, t, t, 0)  # No valid subtrees found
     end
 
-    return valid_subtrees[rand(1:length(valid_subtrees))]
+    selected = valid_subtrees[rand(1:length(valid_subtrees))]
+    return true, selected[1], selected[2], selected[3]
     
 end
 
