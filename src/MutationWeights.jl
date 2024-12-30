@@ -113,7 +113,7 @@ Base.@kwdef mutable struct MutationWeights <: AbstractMutationWeights
     optimize::Float64 = 0.0
     form_connection::Float64 = 0.5
     break_connection::Float64 = 0.1
-    neural_mutate_tree::Float64 = 2.0
+    neural_mutate_tree::Float64 = 1.0
 end
 
 const mutations = fieldnames(MutationWeights)

@@ -11,34 +11,53 @@ export neural_mutate_tree
 const MODEL_REF = Ref{Union{Nothing, ORT.InferenceSession}}(nothing)
 const CFG_REF = Ref{Any}(nothing)
 const OP_INDEX_REF = Ref{Dict{String,Int}}(Dict{String,Int}())
+const OPTIONS_REF = Ref{Union{Nothing, AbstractOptions}}(nothing)
+const ENABLED_REF = Ref{Bool}(false)
 
 function __init__()
     @info "Initializing sampling model."
     MODEL_REF[] = ORT.load_inference("src/dev/ONNX/onnx-models/model-zwrgtnj0.onnx")
 end
 
-function initialize_config_and_ops(options)
-    if CFG_REF[] === nothing
-        CFG_REF[] = nn_config(
-            nbin=4,
-            nuna=6, 
-            nvar=1,
-            seq_len=15
-        )
-        
+function set_config_and_ops(options)
+    CFG_REF[] = nn_config(
+        nbin=4,
+        nuna=6, 
+        nvar=1,
+        seq_len=15
+    )
+    
+    try
         ops = [options.operators.binops..., options.operators.unaops...]
+        # Assert all required operators are present
+        @assert (+) in ops "Addition operator not found in options"
+        @assert (-) in ops "Subtraction operator not found in options"
+        @assert (*) in ops "Multiplication operator not found in options"
+        @assert (/) in ops "Division operator not found in options"
+        @assert sin in ops "Sine operator not found in options"
+        @assert cos in ops "Cosine operator not found in options"
+        @assert exp in ops "Exponential operator not found in options"
+        @assert tanh in ops "Hyperbolic tangent operator not found in options"
+        @assert cosh in ops "Hyperbolic cosine operator not found in options"
+        @assert sinh in ops "Hyperbolic sine operator not found in options"
+
         OP_INDEX_REF[] = Dict{String, Int}(
             "ADD" => findfirst(==(+), ops),
             "SUB" => findfirst(==(-), ops), 
             "MUL" => findfirst(==(*), ops),
             "DIV" => findfirst(==(/), ops),
-            "SIN" => findfirst(==(sin), ops)-CFG_REF[].nbin,
-            "COS" => findfirst(==(cos), ops)-CFG_REF[].nbin,
-            "EXP" => findfirst(==(exp), ops)-CFG_REF[].nbin,
-            "TANH" => findfirst(==(tanh), ops)-CFG_REF[].nbin,
-            "COSH" => findfirst(==(cosh), ops)-CFG_REF[].nbin,
-            "SINH" => findfirst(==(sinh), ops)-CFG_REF[].nbin,
+            "SIN" => findfirst(==(sin), ops) - (CFG_REF[].nbin),
+            "COS" => findfirst(==(cos), ops) - (CFG_REF[].nbin),
+            "EXP" => findfirst(==(exp), ops) - (CFG_REF[].nbin),
+            "TANH" => findfirst(==(tanh), ops) - (CFG_REF[].nbin),
+            "COSH" => findfirst(==(cosh), ops) - (CFG_REF[].nbin),
+            "SINH" => findfirst(==(sinh), ops) - (CFG_REF[].nbin),
         )
+        OPTIONS_REF[] = options
+        ENABLED_REF[] = true
+    catch e
+        @error "Error setting config and ops: $e"
+        ENABLED_REF[] = false
     end
 end
 
@@ -78,18 +97,22 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
-    if MODEL_REF[] === nothing || CFG_REF[] === nothing || OP_INDEX_REF[] === nothing
-        initialize_config_and_ops(options)
+    if OPTIONS_REF[] !== options
+        set_config_and_ops(options)
+    end
+    if !ENABLED_REF[]
+        @info "Neural mutations are disabled. Returning original tree."
+        return tree
     end
 
     # # Select a viable subtree to mutate
     found_subtree, subtree, parent, feature = select_subtree(tree)
-    # @info "Found subtree: $found_subtree; subtree: $subtree; parent: $parent; feature: $feature"
+    println("Found subtree: $found_subtree; subtree: $subtree; parent: $parent; feature: $feature")
     !found_subtree && return tree
     try
         # Encode the subtree into a one-hot vector
         encode_success, x = node_to_onehot(subtree, CFG_REF[])
-        # @info "Encoded subtree: $encode_success"
+        println("Encoded subtree: $encode_success")
         if encode_success
             # Sample new subtree
             input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [0.05])
@@ -97,11 +120,12 @@ function neural_mutate_tree(
             x_out = raw_out["276"][1, :, :]
             prods = logits_to_prods(x_out, true)
             new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
-            # @info "Created new subtree: $subtree -> $new_subtree"
+            println("Created new subtree: $subtree -> $new_subtree")
 
             # Replace the old subtree with the new one
             if parent === nothing
                 # If there's no parent, this means we're replacing the root
+                println("Returning new subtree (without parent): $new_subtree")
                 return new_subtree
             else
                 # Replace the appropriate child in the parent node
@@ -114,13 +138,16 @@ function neural_mutate_tree(
                         parent.r = new_subtree
                     end
                 end
+                println("Returning new subtree (with parent): $new_subtree")
                 return tree
             end
         else
+            println("Returning original subtree (encode failed): $tree")
             return tree
         end
     catch e
         # @error "Error in neural_mutate_tree: $e"
+        println("Returning original subtree (some error during sampling): $tree")
         return tree
     end
 end
