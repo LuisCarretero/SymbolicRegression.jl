@@ -4,7 +4,7 @@ using Random: default_rng, AbstractRNG
 import ONNXRunTime as ORT
 using DynamicExpressions: AbstractExpressionNode, AbstractExpression, NodeSampler, has_operators, with_contents, get_contents
 using ..CoreModule: AbstractOptions, DATA_TYPE
-using ..ParsingModule: nn_config, node_to_onehot, _create_grammar_masks, logits_to_prods, prods_to_tree, select_subtree
+using ..ParsingModule: nn_config, node_to_onehot, _create_grammar_masks, logits_to_prods, prods_to_tree, select_subtree, count_nodes
 
 export neural_mutate_tree
 
@@ -19,6 +19,37 @@ function __init__()
     MODEL_REF[] = ORT.load_inference("src/dev/ONNX/onnx-models/model-zwrgtnj0.onnx")
 end
 
+mutable struct NeuralMutationStats
+    total_attempts::Int
+    successful_mutations::Int
+    encoding_failures::Int
+    sampling_failures::Int
+    total_tree_sizes::Vector{Int}
+    subtree_in_sizes::Vector{Int}
+    subtree_out_sizes::Vector{Int}
+end
+
+const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats(0, 0, 0, 0, Int[], Int[], Int[]))
+
+"""
+    reset_mutation_stats!()
+
+Reset all neural mutation statistics to their initial values.
+"""
+function reset_mutation_stats!()
+    STATS_REF[] = NeuralMutationStats(0, 0, 0, 0, Int[], Int[])
+end
+
+"""
+    get_mutation_stats()
+
+Return the current neural mutation statistics.
+"""
+function get_mutation_stats()
+    return STATS_REF[]
+end
+
+
 function set_config_and_ops(options)
     CFG_REF[] = nn_config(
         nbin=4,
@@ -26,6 +57,8 @@ function set_config_and_ops(options)
         nvar=1,
         seq_len=15
     )
+
+    reset_mutation_stats!()
     
     try
         ops = [options.operators.binops..., options.operators.unaops...]
@@ -92,11 +125,14 @@ function neural_mutate_tree(
     ex = with_contents_for_mutation(ex, neural_mutate_tree(tree, options, rng), context)
     return ex
 end
+
 function neural_mutate_tree(
     tree::AbstractExpressionNode{T},
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
+    STATS_REF[].total_attempts += 1
+
     if OPTIONS_REF[] !== options
         set_config_and_ops(options)
     end
@@ -105,49 +141,51 @@ function neural_mutate_tree(
         return tree
     end
 
-    # # Select a viable subtree to mutate
+    # Select a viable subtree to mutate
     found_subtree, subtree, parent, feature = select_subtree(tree)
-    println("Found subtree: $found_subtree; subtree: $subtree; parent: $parent; feature: $feature")
     !found_subtree && return tree
+
     try
+        # Record tree sizes
+        push!(STATS_REF[].total_tree_sizes, count_nodes(tree))
+        push!(STATS_REF[].subtree_in_sizes, count_nodes(subtree))
+        
         # Encode the subtree into a one-hot vector
         encode_success, x = node_to_onehot(subtree, CFG_REF[])
-        println("Encoded subtree: $encode_success")
-        if encode_success
-            # Sample new subtree
-            input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [0.05])
-            raw_out = MODEL_REF[](input)
-            x_out = raw_out["276"][1, :, :]
-            prods = logits_to_prods(x_out, true)
-            new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
-            println("Created new subtree: $subtree -> $new_subtree")
-
-            # Replace the old subtree with the new one
-            if parent === nothing
-                # If there's no parent, this means we're replacing the root
-                println("Returning new subtree (without parent): $new_subtree")
-                return new_subtree
-            else
-                # Replace the appropriate child in the parent node
-                if parent.degree == 1
-                    parent.l = new_subtree
-                elseif parent.degree == 2
-                    if parent.l === subtree
-                        parent.l = new_subtree
-                    else
-                        parent.r = new_subtree
-                    end
-                end
-                println("Returning new subtree (with parent): $new_subtree")
-                return tree
-            end
+        if !encode_success
+            push!(STATS_REF[].subtree_out_sizes, -1)
+            STATS_REF[].encoding_failures += 1
+            return tree
+        end
+        
+        # Sample new subtree
+        input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [0.01])
+        raw_out = MODEL_REF[](input)
+        x_out = raw_out["276"][1, :, :]
+        prods = logits_to_prods(x_out, true)
+        new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
+        push!(STATS_REF[].subtree_out_sizes, count_nodes(new_subtree))
+        
+        # If we got here, the mutation was successful
+        STATS_REF[].successful_mutations += 1
+        
+        # Replace the old subtree with the new one
+        if parent === nothing
+            return new_subtree
         else
-            println("Returning original subtree (encode failed): $tree")
+            if parent.degree == 1
+                parent.l = new_subtree
+            elseif parent.degree == 2
+                if parent.l === subtree
+                    parent.l = new_subtree
+                else
+                    parent.r = new_subtree
+                end
+            end
             return tree
         end
     catch e
-        # @error "Error in neural_mutate_tree: $e"
-        println("Returning original subtree (some error during sampling): $tree")
+        STATS_REF[].sampling_failures += 1
         return tree
     end
 end

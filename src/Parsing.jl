@@ -295,6 +295,9 @@ Returns the subtree and the feature used in the subtree.
 FIXME: Make stochastic.
 """
 function select_subtree(t::Node)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
+    MIN_NODES = 5
+    MAX_NODES = 14
+
     node_list = _tree_to_prefix(t)
 
     valid_subtrees = []
@@ -302,7 +305,7 @@ function select_subtree(t::Node)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
         subtree_nodes = _tree_to_prefix(node)
         
         # Check size constraint
-        if length(subtree_nodes) < 2 || length(subtree_nodes) > 14
+        if length(subtree_nodes) < MIN_NODES || length(subtree_nodes) > MAX_NODES
             continue
         end
         
@@ -334,6 +337,18 @@ function select_subtree(t::Node)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
     selected = valid_subtrees[rand(1:length(valid_subtrees))]
     return true, selected[1], selected[2], selected[3]
     
+end
+
+function count_nodes(tree::Node)::Int
+    if tree.degree == 0
+        return 1
+    elseif tree.degree == 1
+        return 1 + count_nodes(tree.l)
+    elseif tree.degree == 2
+        return 1 + count_nodes(tree.l) + count_nodes(tree.r)
+    else
+        error("Invalid node degree: $(tree.degree)")
+    end
 end
 
 end
