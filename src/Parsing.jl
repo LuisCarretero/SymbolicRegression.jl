@@ -98,28 +98,27 @@ function node_to_onehot(node::Node{T}, cfg::nn_config)::Tuple{Bool, Matrix{Float
     prefix = _tree_to_prefix(node)
     idx = [_node_to_token_idx(node, cfg) for node in prefix]
     success, onehot, consts = _onehot_encode(idx, cfg)
-    ~success && return false, nothing
+    !success && return (false, nothing)
 
     x = zeros(Float32, cfg.seq_len, cfg.nb_onehot_cats+1)
     x[:, 1:cfg.nb_onehot_cats] = onehot
     x[:, cfg.nb_onehot_cats+1] = consts
-    return true, x
+    return (true, x)
 end
 
-function _onehot_encode(idx::Vector{Tuple{Int, Float64}}, cfg::nn_config)::Tuple{Bool, BitMatrix, Vector{Float64}}
+function _onehot_encode(idx::Vector{Tuple{Int, Float64}}, cfg::nn_config)::Tuple{Bool, Union{BitMatrix, Nothing}, Union{Vector{Float64}, Nothing}}
     onehot = falses(cfg.seq_len, cfg.nb_onehot_cats)
     consts = zeros(Float64, cfg.seq_len)
 
-    if length(idx) > cfg.seq_len
-        return false, nothing, nothing
-    end
+    length(idx) > cfg.seq_len && return (false, nothing, nothing)
+
     for (node_i, (token_idx, token_val)) in enumerate(idx)  # Each node has corresponding index and value
         onehot[node_i, token_idx] = true
         consts[node_i] = token_val
     end
     # Pad with empty token (last category)
     onehot[length(idx)+1:end, end] .= true 
-    return true, onehot, consts
+    return (true, onehot, consts)
 end
 
 function _tree_to_prefix(tree::Node{T})::Vector{Node{T}} where T <: Number
@@ -145,7 +144,8 @@ function _node_to_token_idx(node::Node{T}, cfg::nn_config)::Tuple{Int, Float64} 
         if node.constant
             return (offset_const + 1, node.val)  # Only 1 const token
         else
-            return (offset_var + node.feature, 0)
+            # For multiple variables, do + node.feature instead. 
+            return (offset_var + 1, 0)
         end
     end
 end

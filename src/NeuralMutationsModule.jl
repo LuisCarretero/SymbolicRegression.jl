@@ -17,7 +17,7 @@ const STATS_LOCK = ReentrantLock()
 
 function __init__()
     @info "Initializing sampling model."
-    MODEL_REF[] = ORT.load_inference("src/dev/ONNX/onnx-models/model-zwrgtnj0.onnx")
+    MODEL_REF[] = ORT.load_inference("/Users/luis/Desktop/Cranmer2024/Workplace/smallMutations/similar-expressions/src/dev/ONNX/onnx-models/model-zwrgtnj0.onnx")
 end
 
 mutable struct NeuralMutationStats
@@ -110,6 +110,7 @@ function set_config_and_ops(options)
         @assert tanh in ops "Hyperbolic tangent operator not found in options"
         @assert cosh in ops "Hyperbolic cosine operator not found in options"
         @assert sinh in ops "Hyperbolic sine operator not found in options"
+        @assert length(ops) == (CFG_REF[].nbin + CFG_REF[].nuna) "Additional operators not found in options: $ops"
 
         op_index = Dict{String, Int}(
             "ADD" => findfirst(==(+), ops),
@@ -123,12 +124,15 @@ function set_config_and_ops(options)
             "COSH" => findfirst(==(cosh), ops) - (CFG_REF[].nbin),
             "SINH" => findfirst(==(sinh), ops) - (CFG_REF[].nbin),
         )
+        @assert maximum(values(op_index)) == maximum([CFG_REF[].nbin,  CFG_REF[].nuna]) "Operator index out of bounds"
+        
         OP_INDEX_REF[] = op_index
         OPTIONS_REF[] = options
         reset_mutation_stats!()
         ENABLED_REF[] = true
     catch e
         @error "Error setting config and ops: $e"
+        # throw(e)
         ENABLED_REF[] = false
     end
 end
@@ -182,7 +186,7 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
-    min_nodes = 3
+    min_nodes = 5
     max_nodes = 14
     sample_eps = 0.01
 
