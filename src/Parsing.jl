@@ -289,55 +289,93 @@ function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{
     return build_subtree(prefix_list)
 end
 
+
+
+
 """
-Selects a subtree to use for neural sampling. Requirements for the subtree:
-    - Univariate (only one feature)
-    - 2-14 nodes
+    select_viable_subtree(tree::Node{T}, min_nodes::Int, max_nodes::Int) where T<:Number
 
-Returns the subtree and the feature used in the subtree.
+Analyzes a tree to find valid subtrees for mutation. A valid subtree must:
+- Have between min_nodes and max_nodes total nodes
+- Contain only a single feature variable
 
-FIXME: Make stochastic.
+Returns a tuple containing:
+- success: Boolean indicating if a valid subtree was found
+- node: The selected subtree node
+- parent: The parent node of the selected subtree (or nothing if root)
+- feature: The feature number used in the subtree
+
+The function works by:
+1. Computing descendant counts and feature sets for each node
+2. Finding all valid subtrees that meet the criteria
+3. Randomly selecting one valid subtree
 """
-function select_subtree(t::Node, min_nodes::Int=5, max_nodes::Int=14)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
-    node_list = _tree_to_prefix(t)
-
-    valid_subtrees = []
-    for node in node_list
-        subtree_nodes = _tree_to_prefix(node)
-        
-        # Check size constraint
-        if length(subtree_nodes) < min_nodes || length(subtree_nodes) > max_nodes
-            continue
-        end
-        
-        # Track which features are used
-        features_used = Set{Int}()
-        for n in subtree_nodes
-            if n.degree == 0 && !n.constant
-                push!(features_used, n.feature)
-            end
-        end
-        
-        if length(features_used) == 1
-            # Find parent node
-            parent = nothing
-            for potential_parent in node_list
-                if (isdefined(potential_parent, :l) && potential_parent.l === node) || (isdefined(potential_parent, :r) && potential_parent.r === node)
-                    parent = potential_parent
-                    break
-                end
-            end
-            push!(valid_subtrees, (node, parent, first(features_used)))
-        end
-    end
-
-    if isempty(valid_subtrees)
-        return (false, t, t, 0)  # No valid subtrees found
-    end
-
-    selected = valid_subtrees[rand(1:length(valid_subtrees))]
-    return true, selected[1], selected[2], selected[3]
+function select_viable_subtree(tree::Node{T}, min_nodes::Int, max_nodes::Int) where T<:Number
+    # Store descendant count and feature set for each node
+    desc_counts = Dict{Node{T}, Int}() 
+    feature_sets = Dict{Node{T}, Set{Int}}()
     
+    # Helper function to compute descendants recursively
+    function count_descendants(node::Node{T})::Tuple{Int,Set{Int}}
+        if haskey(desc_counts, node)
+            return desc_counts[node], feature_sets[node]
+        end
+        
+        features = Set{Int}()
+        if node.degree == 0
+            if !node.constant
+                push!(features, node.feature)
+            end
+            desc_counts[node] = 1
+            feature_sets[node] = features
+            return 1, features
+        end
+        
+        left_count, left_features = count_descendants(node.l)
+        right_count = 0
+        right_features = Set{Int}()
+        if node.degree == 2
+            right_count, right_features = count_descendants(node.r)
+        end
+        
+        total = 1 + left_count + right_count
+        union!(features, left_features, right_features)
+        
+        desc_counts[node] = total
+        feature_sets[node] = features
+        return total, features
+    end
+    
+    # Compute descendants for whole tree
+    count_descendants(tree)
+    
+    # Find valid subtrees
+    valid_subtrees = []
+    function check_node(node::Node{T}, parent::Union{Node{T},Nothing})
+        count = desc_counts[node]
+        features = feature_sets[node]
+        
+        if min_nodes <= count <= max_nodes && length(features) == 1
+            push!(valid_subtrees, (node, parent, first(features)))
+        end
+        
+        if node.degree >= 1
+            check_node(node.l, node)
+            if node.degree == 2
+                check_node(node.r, node) 
+            end
+        end
+    end
+    
+    check_node(tree, nothing)
+    
+    if isempty(valid_subtrees)
+        return false, tree, nothing, 0
+    end
+    
+    # Randomly select one valid subtree
+    selected = rand(valid_subtrees)
+    return true, selected[1], selected[2], selected[3]
 end
 
 function count_nodes(tree::Node)::Int

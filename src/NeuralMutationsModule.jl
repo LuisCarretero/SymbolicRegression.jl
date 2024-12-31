@@ -4,7 +4,7 @@ using Random: default_rng, AbstractRNG
 import ONNXRunTime as ORT
 using DynamicExpressions: AbstractExpressionNode, AbstractExpression, NodeSampler, has_operators, with_contents, get_contents
 using ..CoreModule: AbstractOptions, DATA_TYPE
-using ..ParsingModule: nn_config, node_to_onehot, _create_grammar_masks, logits_to_prods, prods_to_tree, select_subtree, count_nodes
+using ..ParsingModule: nn_config, node_to_onehot, _create_grammar_masks, logits_to_prods, prods_to_tree, select_viable_subtree, count_nodes
 
 export neural_mutate_tree
 
@@ -178,8 +178,10 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
-    min_nodes = 5
+    min_nodes = 3
     max_nodes = 14
+    sample_eps = 0.01
+
     lock(STATS_LOCK) do
         increment_stats!(STATS_REF[], :total_attempts)
 
@@ -193,7 +195,7 @@ function neural_mutate_tree(
         end
 
         # Select a viable subtree to mutate
-        found_subtree, subtree, parent, feature = select_subtree(tree, min_nodes, max_nodes)
+        found_subtree, subtree, parent, feature = select_viable_subtree(tree, min_nodes, max_nodes)
         if !found_subtree
             increment_stats!(STATS_REF[], :no_subtree_found)
             return tree
@@ -210,7 +212,7 @@ function neural_mutate_tree(
         end
         
         # Sample new subtree
-        x_out = sample_logits(x, 0.1)
+        x_out = sample_logits(x, sample_eps)
         success, prods = logits_to_prods(x_out, true)
         if !success
             add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
