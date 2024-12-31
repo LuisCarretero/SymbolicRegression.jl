@@ -16,8 +16,7 @@ const ENABLED_REF = Ref{Bool}(false)
 const STATS_LOCK = ReentrantLock()
 
 function __init__()
-    @info "Initializing sampling model."
-    MODEL_REF[] = ORT.load_inference("/Users/luis/Desktop/Cranmer2024/Workplace/smallMutations/similar-expressions/src/dev/ONNX/onnx-models/model-zwrgtnj0.onnx")
+    
 end
 
 mutable struct NeuralMutationStats
@@ -70,26 +69,28 @@ function increment_stats!(stats::NeuralMutationStats, type::Symbol, with_lock::B
 end
 
 const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats())
-"""
-    reset_mutation_stats!()
 
-Reset all neural mutation statistics to their initial values.
-"""
 function reset_mutation_stats!()
     STATS_REF[] = NeuralMutationStats()
 end
 
-"""
-    get_mutation_stats()
-
-Return the current neural mutation statistics.
-"""
 function get_mutation_stats()
     return STATS_REF[]
 end
 
 
-function set_config_and_ops(options)
+function set_config_and_ops(options::AbstractOptions)
+    OPTIONS_REF[] = options
+
+    if !options.neural_options.active
+        @info "Neural mutations are disabled but were called. Skipping setup. (are MutationWeights.neural_mutate_tree set to >0.0?)"
+        ENABLED_REF[] = false
+        return
+    end
+    @info "Initializing sampling model."
+    MODEL_REF[] = ORT.load_inference(options.neural_options.model_path)
+
+    # nn_config and supported operators are NN-specific and cannot be changed for now
     CFG_REF[] = nn_config(
         nbin=4,
         nuna=6, 
@@ -127,12 +128,10 @@ function set_config_and_ops(options)
         @assert maximum(values(op_index)) == maximum([CFG_REF[].nbin,  CFG_REF[].nuna]) "Operator index out of bounds"
         
         OP_INDEX_REF[] = op_index
-        OPTIONS_REF[] = options
         reset_mutation_stats!()
         ENABLED_REF[] = true
     catch e
-        @error "Error setting config and ops: $e"
-        # throw(e)
+        @error "Error setting up neural mutations. Disabling module. $e"
         ENABLED_REF[] = false
     end
 end
@@ -186,23 +185,18 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
-    min_nodes = 5
-    max_nodes = 14
-    sample_eps = 0.01
-
     increment_stats!(STATS_REF[], :total_attempts, true)
 
     if OPTIONS_REF[] !== options
         set_config_and_ops(options)
     end
     if !ENABLED_REF[]
-        @info "Neural mutations are disabled. Returning original tree."
         increment_stats!(STATS_REF[], :module_not_enabled, true)
         return tree
     end
 
     # Select a viable subtree to mutate
-    found_subtree, subtree, parent, feature = select_viable_subtree(tree, min_nodes, max_nodes)
+    found_subtree, subtree, parent, feature = select_viable_subtree(tree, options.neural_options.subtree_min_nodes, options.neural_options.subtree_max_nodes)
     if !found_subtree
         increment_stats!(STATS_REF[], :no_subtree_found, true)
         return tree
@@ -216,7 +210,7 @@ function neural_mutate_tree(
     end
     
     # Sample new subtree
-    x_out = sample_logits(x, sample_eps)
+    x_out = sample_logits(x, options.neural_options.sampling_eps)
     success, prods = logits_to_prods(x_out, true)
     if !success
         increment_stats!(STATS_REF[], :decoding_failures, true)
