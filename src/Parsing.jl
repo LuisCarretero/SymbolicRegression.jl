@@ -150,8 +150,11 @@ function _node_to_token_idx(node::Node{T}, cfg::nn_config)::Tuple{Int, Float64} 
     end
 end
 
-
-function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length::Int=15)::Vector{Tuple{String, String}}
+"""
+Convert logits to production rules.
+First flag is ``success``, second flag is ``prods``.
+"""
+function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length::Int=15)::Tuple{Bool, Union{Vector{Tuple{String, String}}, Nothing}}
     # Initialize empty stack with start symbol 'S'
     stack = ["S"]
     
@@ -172,8 +175,9 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
         # Calculate probabilities
         probs = mask .* exp.(logits_prods[t, :])
         tot = sum(probs)
-        @assert tot > 0 "Sum of probs is 0 at t=$t. Probably due to bad mask or invalid logits?"
+        tot == 0 && return (false, nothing)  # No valid productions found
         probs = probs ./ tot
+        any(isnan.(probs)) && return (false, nothing)
         
         # Select production rule
         if sample
@@ -211,7 +215,7 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
         end
     end
     
-    return prods
+    return true, prods
 end
 
 function prods_to_tree(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, feature::Int)
@@ -257,32 +261,32 @@ function _make_childless_op(degree::Int, op_index::Int, ::Type{T})::Node{T} wher
     return op_node
 end
 
+function build_subtree(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}}} where {T<:Number}
+    isempty(prefix_list) && return false, Node{T}()
+
+    node = popfirst!(prefix_list)
+    success = true
+    if node.degree == 0
+        # Leaf node, no children to add
+    elseif node.degree == 1
+        success, node.l = build_subtree(prefix_list)
+    elseif node.degree == 2
+        success1, node.l = build_subtree(prefix_list)
+        success2, node.r = build_subtree(prefix_list)
+        success = success1 && success2
+    else
+        error("Prefix_to_tree: Invalid node degree: $(node.degree)")
+    end
+    return success, node
+end
+
 """
 Copied from datagen/ExpressionGenerator.jl. Consolidate.
-"""
-function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Node{T} where {T<:Number}
-    function build_subtree()
-        if isempty(prefix_list)
-            error("Prefix_to_tree: Unexpected end of prefix list")
-        end
-        node = popfirst!(prefix_list)
-        if node.degree == 0
-            # Leaf node, no children to add
-        elseif node.degree == 1
-            node.l = build_subtree()
-        elseif node.degree == 2
-            node.l = build_subtree()
-            node.r = build_subtree()
-        else
-            error("Prefix_to_tree: Invalid node degree: $(node.degree)")
-        end
-        return node
-    end
 
-    if isempty(prefix_list)
-        error("Prefix_to_tree: Empty prefix list")
-    end
-    return build_subtree()
+First flag is ``success``, second flag is ``node``.
+"""
+function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}, Nothing}} where {T<:Number}
+    return build_subtree(prefix_list)
 end
 
 """

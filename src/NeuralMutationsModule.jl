@@ -13,6 +13,7 @@ const CFG_REF = Ref{Any}(nothing)
 const OP_INDEX_REF = Ref{Dict{String,Int}}(Dict{String,Int}())
 const OPTIONS_REF = Ref{Union{Nothing, AbstractOptions}}(nothing)
 const ENABLED_REF = Ref{Bool}(false)
+const STATS_LOCK = ReentrantLock()
 
 function __init__()
     @info "Initializing sampling model."
@@ -27,17 +28,48 @@ mutable struct NeuralMutationStats
     total_tree_sizes::Vector{Int}
     subtree_in_sizes::Vector{Int}
     subtree_out_sizes::Vector{Int}
+
+    function NeuralMutationStats(
+        total_attempts=0,
+        successful_mutations=0,
+        encoding_failures=0,
+        sampling_failures=0
+    )
+        new(
+            total_attempts,
+            successful_mutations,
+            encoding_failures,
+            sampling_failures,
+            Int[],  # Initialize empty vectors
+            Int[],
+            Int[]
+        )
+    end
 end
 
-const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats(0, 0, 0, 0, Int[], Int[], Int[]))
+function add_to_stats!(stats::NeuralMutationStats, type::Symbol, value::Int)
+    lock(STATS_LOCK) do
+        vec = getfield(stats, type)
+        # println("Adding $value to $type")
+        # println(vec)
+        push!(vec, value)
+    end
+end
 
+function increment_stats!(stats::NeuralMutationStats, type::Symbol)
+    lock(STATS_LOCK) do
+        setfield!(stats, type, getfield(stats, type) + 1)
+    end
+end
+
+const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats())
 """
     reset_mutation_stats!()
 
 Reset all neural mutation statistics to their initial values.
 """
 function reset_mutation_stats!()
-    STATS_REF[] = NeuralMutationStats(0, 0, 0, 0, Int[], Int[])
+    STATS_REF[] = NeuralMutationStats()
 end
 
 """
@@ -57,8 +89,6 @@ function set_config_and_ops(options)
         nvar=1,
         seq_len=15
     )
-
-    reset_mutation_stats!()
     
     try
         ops = [options.operators.binops..., options.operators.unaops...]
@@ -74,7 +104,7 @@ function set_config_and_ops(options)
         @assert cosh in ops "Hyperbolic cosine operator not found in options"
         @assert sinh in ops "Hyperbolic sine operator not found in options"
 
-        OP_INDEX_REF[] = Dict{String, Int}(
+        op_index = Dict{String, Int}(
             "ADD" => findfirst(==(+), ops),
             "SUB" => findfirst(==(-), ops), 
             "MUL" => findfirst(==(*), ops),
@@ -86,12 +116,26 @@ function set_config_and_ops(options)
             "COSH" => findfirst(==(cosh), ops) - (CFG_REF[].nbin),
             "SINH" => findfirst(==(sinh), ops) - (CFG_REF[].nbin),
         )
+        OP_INDEX_REF[] = op_index
         OPTIONS_REF[] = options
+        reset_mutation_stats!()
         ENABLED_REF[] = true
     catch e
         @error "Error setting config and ops: $e"
         ENABLED_REF[] = false
     end
+end
+
+"""
+    sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
+
+Sample the logits of the neural network.
+"""
+function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
+    input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [eps])
+    raw_out = MODEL_REF[](input)
+    x_out = raw_out["276"][1, :, :]
+    return x_out
 end
 
 """
@@ -131,7 +175,7 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
-    STATS_REF[].total_attempts += 1
+    increment_stats!(STATS_REF[], :total_attempts)
 
     if OPTIONS_REF[] !== options
         set_config_and_ops(options)
@@ -145,47 +189,51 @@ function neural_mutate_tree(
     found_subtree, subtree, parent, feature = select_subtree(tree)
     !found_subtree && return tree
 
-    try
-        # Record tree sizes
-        push!(STATS_REF[].total_tree_sizes, count_nodes(tree))
-        push!(STATS_REF[].subtree_in_sizes, count_nodes(subtree))
-        
-        # Encode the subtree into a one-hot vector
-        encode_success, x = node_to_onehot(subtree, CFG_REF[])
-        if !encode_success
-            push!(STATS_REF[].subtree_out_sizes, -1)
-            STATS_REF[].encoding_failures += 1
-            return tree
-        end
-        
-        # Sample new subtree
-        input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [0.01])
-        raw_out = MODEL_REF[](input)
-        x_out = raw_out["276"][1, :, :]
-        prods = logits_to_prods(x_out, true)
-        new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
-        push!(STATS_REF[].subtree_out_sizes, count_nodes(new_subtree))
-        
-        # If we got here, the mutation was successful
-        STATS_REF[].successful_mutations += 1
-        
-        # Replace the old subtree with the new one
-        if parent === nothing
-            return new_subtree
-        else
-            if parent.degree == 1
+    # Record tree sizes
+
+    add_to_stats!(STATS_REF[], :total_tree_sizes, count_nodes(tree))
+    add_to_stats!(STATS_REF[], :subtree_in_sizes, count_nodes(subtree))
+
+    
+    # Encode the subtree into a one-hot vector
+    encode_success, x = node_to_onehot(subtree, CFG_REF[])
+    if !encode_success
+        add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
+        increment_stats!(STATS_REF[], :encoding_failures)
+        return tree
+    end
+    
+    # Sample new subtree
+    x_out = sample_logits(x, 0.01)
+    success, prods = logits_to_prods(x_out, true)
+    if !success
+        add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
+        increment_stats!(STATS_REF[], :sampling_failures)
+        return tree
+    end
+
+    success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
+    if !success
+        add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
+        increment_stats!(STATS_REF[], :sampling_failures)
+        return tree
+    end 
+    add_to_stats!(STATS_REF[], :subtree_out_sizes, count_nodes(new_subtree))
+    increment_stats!(STATS_REF[], :successful_mutations)
+    
+    # Replace the old subtree with the new one
+    if parent === nothing
+        return new_subtree
+    else
+        if parent.degree == 1
+            parent.l = new_subtree
+        elseif parent.degree == 2
+            if parent.l === subtree
                 parent.l = new_subtree
-            elseif parent.degree == 2
-                if parent.l === subtree
-                    parent.l = new_subtree
-                else
-                    parent.r = new_subtree
-                end
+            else
+                parent.r = new_subtree
             end
-            return tree
         end
-    catch e
-        STATS_REF[].sampling_failures += 1
         return tree
     end
 end
