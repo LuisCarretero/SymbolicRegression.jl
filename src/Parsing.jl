@@ -369,13 +369,11 @@ function select_viable_subtree(tree::Node{T}, min_nodes::Int, max_nodes::Int) wh
     
     check_node(tree, nothing)
     
-    if isempty(valid_subtrees)
-        return false, tree, nothing, 0
-    end
+    isempty(valid_subtrees) && return (false, tree, nothing, 0)
     
     # Randomly select one valid subtree
     selected = rand(valid_subtrees)
-    return true, selected[1], selected[2], selected[3]
+    return (true, selected[1], selected[2], selected[3])
 end
 
 function count_nodes(tree::Node)::Int
