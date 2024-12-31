@@ -7,6 +7,7 @@ using DynamicExpressions:
 using LossFunctions: SupervisedLoss
 
 import ..MutationWeightsModule: AbstractMutationWeights
+import ..NeuralOptionsModule: NeuralOptions
 
 """
 This struct defines how complexity is calculated.
@@ -256,6 +257,7 @@ struct Options{
     deterministic::Bool
     define_helper_functions::Bool
     use_recorder::Bool
+    neural_options::NeuralOptions
 end
 
 function Base.print(io::IO, @nospecialize(options::Options))

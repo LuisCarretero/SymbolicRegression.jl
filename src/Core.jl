@@ -6,6 +6,7 @@ include("Utils.jl")
 include("ProgramConstants.jl")
 include("Dataset.jl")
 include("MutationWeights.jl")
+include("NeuralOptions.jl")
 include("OptionsStruct.jl")
 include("Operators.jl")
 include("Options.jl")
@@ -19,6 +20,7 @@ using .OptionsStructModule:
     ComplexityMapping,
     specialized_options,
     operator_specialization
+using .NeuralOptionsModule: NeuralOptions
 using .OperatorsModule:
     get_safe_op,
     plus,

@@ -28,6 +28,7 @@ using ..OperatorsModule:
     safe_acosh,
     safe_atanh
 using ..MutationWeightsModule: AbstractMutationWeights, MutationWeights, mutations
+using ..NeuralOptionsModule: NeuralOptions, validate_neural_options
 import ..OptionsStructModule: Options
 using ..OptionsStructModule: ComplexityMapping, operator_specialization
 using ..UtilsModule: @save_kwargs, @ignore
@@ -211,6 +212,10 @@ end
 
 create_mutation_weights(w::AbstractMutationWeights) = w
 create_mutation_weights(w::NamedTuple) = MutationWeights(; w...)
+
+# Constructors
+create_neural_options(options::NeuralOptions) = options
+create_neural_options(options::NamedTuple) = NeuralOptions(; options...)
 
 const deprecated_options_mapping = Base.ImmutableDict(
     :mutationWeights => :mutation_weights,
@@ -446,6 +451,7 @@ const OPTION_DESCRIPTIONS = """- `defaults`: What set of defaults to use for `Op
     in serial mode.
 - `define_helper_functions`: Whether to define helper functions
     for constructing and evaluating trees.
+- `neural_options`: Options for neural sampling.
 """
 
 """
@@ -617,6 +623,7 @@ $(OPTION_DESCRIPTIONS)
     npopulations::Union{Nothing,Integer}=nothing,
     npop::Union{Nothing,Integer}=nothing,
     deprecated_return_state::Union{Bool,Nothing}=nothing,
+    neural_options::NeuralOptions=NeuralOptions(),
     kws...,
     #########################################
 )
@@ -945,6 +952,7 @@ $(OPTION_DESCRIPTIONS)
         deterministic,
         define_helper_functions,
         use_recorder,
+        neural_options,
     )
 
     return options
