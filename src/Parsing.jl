@@ -298,10 +298,7 @@ Returns the subtree and the feature used in the subtree.
 
 FIXME: Make stochastic.
 """
-function select_subtree(t::Node)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
-    MIN_NODES = 5
-    MAX_NODES = 14
-
+function select_subtree(t::Node, min_nodes::Int=5, max_nodes::Int=14)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
     node_list = _tree_to_prefix(t)
 
     valid_subtrees = []
@@ -309,7 +306,7 @@ function select_subtree(t::Node)::Tuple{Bool, Node, Union{Node, Nothing}, Int}
         subtree_nodes = _tree_to_prefix(node)
         
         # Check size constraint
-        if length(subtree_nodes) < MIN_NODES || length(subtree_nodes) > MAX_NODES
+        if length(subtree_nodes) < min_nodes || length(subtree_nodes) > max_nodes
             continue
         end
         

@@ -178,6 +178,8 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
+    min_nodes = 5
+    max_nodes = 14
     lock(STATS_LOCK) do
         increment_stats!(STATS_REF[], :total_attempts)
 
@@ -191,7 +193,7 @@ function neural_mutate_tree(
         end
 
         # Select a viable subtree to mutate
-        found_subtree, subtree, parent, feature = select_subtree(tree)
+        found_subtree, subtree, parent, feature = select_subtree(tree, min_nodes, max_nodes)
         if !found_subtree
             increment_stats!(STATS_REF[], :no_subtree_found)
             return tree
@@ -208,7 +210,7 @@ function neural_mutate_tree(
         end
         
         # Sample new subtree
-        x_out = sample_logits(x, 0.0001)
+        x_out = sample_logits(x, 0.1)
         success, prods = logits_to_prods(x_out, true)
         if !success
             add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
