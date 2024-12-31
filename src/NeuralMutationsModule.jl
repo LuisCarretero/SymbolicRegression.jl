@@ -56,13 +56,17 @@ mutable struct NeuralMutationStats
     end
 end
 
-function add_to_stats!(stats::NeuralMutationStats, type::Symbol, value::Int)
+function add_to_stats!(stats::NeuralMutationStats, type::Symbol, with_lock::Bool, value::Int)
+    with_lock && lock(STATS_LOCK)
     vec = getfield(stats, type)
     push!(vec, value)
+    with_lock && unlock(STATS_LOCK)
 end
 
-function increment_stats!(stats::NeuralMutationStats, type::Symbol)
+function increment_stats!(stats::NeuralMutationStats, type::Symbol, with_lock::Bool)
+    with_lock && lock(STATS_LOCK)
     setfield!(stats, type, getfield(stats, type) + 1)
+    with_lock && unlock(STATS_LOCK)
 end
 
 const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats())
@@ -182,68 +186,66 @@ function neural_mutate_tree(
     max_nodes = 14
     sample_eps = 0.01
 
+    increment_stats!(STATS_REF[], :total_attempts, true)
+
+    if OPTIONS_REF[] !== options
+        set_config_and_ops(options)
+    end
+    if !ENABLED_REF[]
+        @info "Neural mutations are disabled. Returning original tree."
+        increment_stats!(STATS_REF[], :module_not_enabled, true)
+        return tree
+    end
+
+    # Select a viable subtree to mutate
+    found_subtree, subtree, parent, feature = select_viable_subtree(tree, min_nodes, max_nodes)
+    if !found_subtree
+        increment_stats!(STATS_REF[], :no_subtree_found, true)
+        return tree
+    end
+    
+    # Encode the subtree into a one-hot vector
+    encode_success, x = node_to_onehot(subtree, CFG_REF[])
+    if !encode_success
+        increment_stats!(STATS_REF[], :encoding_failures, true)
+        return tree
+    end
+    
+    # Sample new subtree
+    x_out = sample_logits(x, sample_eps)
+    success, prods = logits_to_prods(x_out, true)
+    if !success
+        increment_stats!(STATS_REF[], :decoding_failures, true)
+        return tree
+    end
+
+    success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
+    if !success
+        increment_stats!(STATS_REF[], :tree_build_failures, true)
+        return tree
+    end 
+
     lock(STATS_LOCK) do
-        increment_stats!(STATS_REF[], :total_attempts)
-
-        if OPTIONS_REF[] !== options
-            set_config_and_ops(options)
-        end
-        if !ENABLED_REF[]
-            @info "Neural mutations are disabled. Returning original tree."
-            increment_stats!(STATS_REF[], :module_not_enabled)
-            return tree
-        end
-
-        # Select a viable subtree to mutate
-        found_subtree, subtree, parent, feature = select_viable_subtree(tree, min_nodes, max_nodes)
-        if !found_subtree
-            increment_stats!(STATS_REF[], :no_subtree_found)
-            return tree
-        end
-        add_to_stats!(STATS_REF[], :total_tree_sizes, count_nodes(tree))
-        add_to_stats!(STATS_REF[], :subtree_in_sizes, count_nodes(subtree))
-        
-        # Encode the subtree into a one-hot vector
-        encode_success, x = node_to_onehot(subtree, CFG_REF[])
-        if !encode_success
-            add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
-            increment_stats!(STATS_REF[], :encoding_failures)
-            return tree
-        end
-        
-        # Sample new subtree
-        x_out = sample_logits(x, sample_eps)
-        success, prods = logits_to_prods(x_out, true)
-        if !success
-            add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
-            increment_stats!(STATS_REF[], :decoding_failures)
-            return tree
-        end
-
-        success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
-        if !success
-            add_to_stats!(STATS_REF[], :subtree_out_sizes, -1)
-            increment_stats!(STATS_REF[], :tree_build_failures)
-            return tree
-        end 
-        add_to_stats!(STATS_REF[], :subtree_out_sizes, count_nodes(new_subtree))
-        increment_stats!(STATS_REF[], :successful_mutations)
-        
-        # Replace the old subtree with the new one
-        if parent === nothing
-            return new_subtree
-        else
-            if parent.degree == 1
+        add_to_stats!(STATS_REF[], :total_tree_sizes, false, count_nodes(tree))
+        add_to_stats!(STATS_REF[], :subtree_in_sizes, false, count_nodes(subtree))
+        add_to_stats!(STATS_REF[], :subtree_out_sizes, false, count_nodes(new_subtree))
+        increment_stats!(STATS_REF[], :successful_mutations, false)
+    end
+    
+    # Replace the old subtree with the new one
+    if parent === nothing
+        return new_subtree
+    else
+        if parent.degree == 1
+            parent.l = new_subtree
+        elseif parent.degree == 2
+            if parent.l === subtree
                 parent.l = new_subtree
-            elseif parent.degree == 2
-                if parent.l === subtree
-                    parent.l = new_subtree
-                else
-                    parent.r = new_subtree
-                end
+            else
+                parent.r = new_subtree
             end
-            return tree
         end
+        return tree
     end
 end
 
