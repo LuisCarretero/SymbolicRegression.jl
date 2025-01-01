@@ -172,12 +172,12 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
         symbol_idx = findfirst(==(alpha), unique_lhs)
         mask = masks[symbol_idx, :]
         
-        # Calculate probabilities
+        # Calculate probabilities  FIXME: Make this robust&pretty
         probs = mask .* exp.(logits_prods[t, :])
         tot = sum(probs)
         tot == 0 && return (false, nothing)  # No valid productions found
         probs = probs ./ tot
-        any(isnan.(probs)) && return (false, nothing)
+        (any(isnan.(probs)) || sum(probs) != 1) && return (false, nothing)
         
         # Select production rule
         if sample
