@@ -83,7 +83,7 @@ function set_config_and_ops(options::AbstractOptions)
     OPTIONS_REF[] = options
 
     if !options.neural_options.active
-        @info "Neural mutations are disabled but were called. Skipping setup. (are MutationWeights.neural_mutate_tree set to >0.0?)"
+        @info "Neural mutation module is disabled but was called. Skipping setup. (are MutationWeights.neural_mutate_tree set to >0.0?)"
         ENABLED_REF[] = false
         return
     end
@@ -185,11 +185,9 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
+    OPTIONS_REF[] !== options && set_config_and_ops(options)
+    
     increment_stats!(STATS_REF[], :total_attempts, true)
-
-    if OPTIONS_REF[] !== options
-        set_config_and_ops(options)
-    end
     if !ENABLED_REF[]
         increment_stats!(STATS_REF[], :module_not_enabled, true)
         return tree
