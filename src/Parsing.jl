@@ -159,7 +159,7 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
     stack = ["S"]
     
     # Split logits into productions and constants
-    logits_prods = logits[:, 1:end-1] 
+    logits_prods = clamp.(logits[:, 1:end-1], -84.0f0, 84.0f0) # Clamp to avoid overflow in exp(x) and sum(exp(x)) for Float32 ( log(floatmax(Float32)/Ncats) )
     constants = logits[:, end]
     
     prods = []
@@ -172,16 +172,14 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
         symbol_idx = findfirst(==(alpha), unique_lhs)
         mask = masks[symbol_idx, :]
         
-        # Calculate probabilities  FIXME: Make this robust&pretty
+        # Calculate probabilities
         probs = mask .* exp.(logits_prods[t, :])
         tot = sum(probs)
         if tot == 0 || !isfinite(tot)
-            @warn "Numerical issues 1: probs: $(probs), sum: $(tot)"
             return (false, nothing)  # No valid productions or numerical issues
         end
         probs = probs ./ tot
-        if !isapprox(sum(probs), one(Float32))
-            @warn "Numerical issues 2: probs: $(probs), sum: $(sum(probs)), original logits: $(logits_prods[t, :])"
+        if !isapprox(sum(probs), one(Float32))  # Same test as in Categorical() to not throw errors
             return (false, nothing)  # Check for NaN/Inf and verify distribution sums to 1
         end
         
