@@ -48,7 +48,7 @@ for line in split(grammar_str, "\n")
 end
 grammar_str = join(grammar_lines, "\n")
 
-function _create_grammar_masks(grammar_str::String)
+function _create_grammar_masks(grammar_str::String)::Tuple{Matrix{Bool}, Vector{Int}, Vector{String}}
     # Collect all LHS symbols and unique set
     all_lhs = String[]
     unique_lhs = String[]
@@ -175,9 +175,15 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
         # Calculate probabilities  FIXME: Make this robust&pretty
         probs = mask .* exp.(logits_prods[t, :])
         tot = sum(probs)
-        tot == 0 && return (false, nothing)  # No valid productions found
+        if tot == 0 || !isfinite(tot)
+            @warn "Numerical issues 1: probs: $(probs), sum: $(tot)"
+            return (false, nothing)  # No valid productions or numerical issues
+        end
         probs = probs ./ tot
-        (any(isnan.(probs)) || sum(probs) != 1) && return (false, nothing)
+        if !isapprox(sum(probs), one(Float32))
+            @warn "Numerical issues 2: probs: $(probs), sum: $(sum(probs)), original logits: $(logits_prods[t, :])"
+            return (false, nothing)  # Check for NaN/Inf and verify distribution sums to 1
+        end
         
         # Select production rule
         if sample
