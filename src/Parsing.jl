@@ -4,9 +4,18 @@ import SymbolicRegression: Node
 using Distributions: Categorical
 
 # Define grammar rules similar to Python version
-grammar_str = """
+# grammar_str = """
+# S -> 'ADD' S S | 'SUB' S S | 'MUL' S S | 'DIV' S S
+# S -> 'SIN' S | 'COS' S | 'EXP' S | 'TANH' S | 'COSH' S | 'SINH' S 
+# S -> 'CON'
+# S -> 'x1'
+# END -> 'END'
+# """
+# FIXME: This needs to be adjusted to always have the same order as syntax_cats used in model
+# Currently using: logit_index = ["ADD", "SUB", "MUL", "DIV", "SIN", "COS", "EXP", "ZERO_SQRT", "CON", "x1", "END"]
+GRAMMAR_STR_RAW = """
 S -> 'ADD' S S | 'SUB' S S | 'MUL' S S | 'DIV' S S
-S -> 'SIN' S | 'COS' S | 'EXP' S | 'TANH' S | 'COSH' S | 'SINH' S 
+S -> 'SIN' S | 'COS' S | 'EXP' S | 'ZERO_SQRT' S
 S -> 'CON'
 S -> 'x1'
 END -> 'END'
@@ -29,24 +38,29 @@ const OPERATOR_ARITY = Dict{String, Int}(
     "COSH" => 1,
     "TANH" => 1,
 
+    # Custom operator
+    "ZERO_SQRT" => 1,
+
     # FIXME: Handle this differently!
     "x1" => 0
 )
 
 # Split each production rule into separate lines
-grammar_lines = String[]
-for line in split(grammar_str, "\n")
-    line = strip(line)
-    if !isempty(line)
-        lhs, rhs = split(line, "->")
-        lhs = strip(lhs)
-        # Split on | and create new lines
-        for rule in split(rhs, "|")
-            push!(grammar_lines, "$lhs -> $(strip(rule))")
+function _split_grammar_rules(grammar_str::String)::String
+    grammar_lines = String[]
+    for line in split(grammar_str, "\n")
+        line = strip(line)
+        if !isempty(line)
+            lhs, rhs = split(line, "->")
+            lhs = strip(lhs)
+            # Split on | and create new lines
+            for rule in split(rhs, "|")
+                push!(grammar_lines, "$lhs -> $(strip(rule))")
+            end
         end
     end
+    return join(grammar_lines, "\n")
 end
-grammar_str = join(grammar_lines, "\n")
 
 function _create_grammar_masks(grammar_str::String)::Tuple{Matrix{Bool}, Vector{Int}, Vector{String}}
     # Collect all LHS symbols and unique set
@@ -77,7 +91,10 @@ function _create_grammar_masks(grammar_str::String)::Tuple{Matrix{Bool}, Vector{
 
     return masks, allowed_prod_idx, unique_lhs
 end
-masks, allowed_prod_idx, unique_lhs = _create_grammar_masks(grammar_str)
+
+# FIXME: Call in some kind of init function
+grammar_str = _split_grammar_rules(GRAMMAR_STR_RAW)
+grammar_masks, allowed_prod_idx, unique_lhs = _create_grammar_masks(grammar_str)
 
 mutable struct nn_config
     nbin::Int
@@ -94,9 +111,9 @@ mutable struct nn_config
 end
 
 
-function node_to_onehot(node::Node{T}, cfg::nn_config)::Tuple{Bool, Matrix{Float32}} where T <: Number
+function node_to_onehot(node::Node{T}, cfg::nn_config, op_to_logits::Dict{Tuple{Int,Int}, Int})::Tuple{Bool, Matrix{Float32}} where T <: Number
     prefix = _tree_to_prefix(node)
-    idx = [_node_to_token_idx(node, cfg) for node in prefix]
+    idx = [_node_to_token_idx(node, op_to_logits) for node in prefix]
     success, onehot, consts = _onehot_encode(idx, cfg)
     !success && return (false, nothing)
 
@@ -132,20 +149,24 @@ function _tree_to_prefix(tree::Node{T})::Vector{Node{T}} where T <: Number
     return result
 end
 
-function _node_to_token_idx(node::Node{T}, cfg::nn_config)::Tuple{Int, Float64} where T <: Number
-    offset_unaop = cfg.nbin
-    offset_const = offset_unaop + cfg.nuna
-    offset_var = offset_const + cfg.nvar
+"""
+Encoding node (with op index) into token index used by NN.
+
+Needs mapping from (srjl_op_idx, op_deg) -> token_idx.
+"""
+function _node_to_token_idx(node::Node{T}, op_to_logits::Dict{Tuple{Int,Int}, Int})::Tuple{Int, Float64} where T <: Number
+    idx_const = length(op_to_logits) + 1 # [..., "last_op", "CON", "x1", "END"] 
+    idx_var = idx_const + 1  # Always assuming we have a single 
     if node.degree == 2
-        return (node.op, 0)
+        return (op_to_logits[(node.op, 2)], 0)
     elseif node.degree == 1
-        return (offset_unaop + node.op, 0)
+        return (op_to_logits[(node.op, 1)], 0)
     elseif node.degree == 0
         if node.constant
-            return (offset_const + 1, node.val)  # Only 1 const token
+            return (idx_const, node.val)  # Only 1 const token
         else
-            # For multiple variables, do + node.feature instead. 
-            return (offset_var + 1, 0)
+            # FIXME: For multiple variables, do + node.feature instead. 
+            return (idx_var, 0)
         end
     end
 end
@@ -153,8 +174,14 @@ end
 """
 Convert logits to production rules.
 First flag is ``success``, second flag is ``prods``.
+
+Uses GRAMMAR to get mapping from token_idx -> op_string.
 """
-function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length::Int=15)::Tuple{Bool, Union{Vector{Tuple{String, String}}, Nothing}}
+function logits_to_prods(  # FIXME: Think of better way than to just use global vars for grammar_masks, etc.
+    logits::Matrix{Float32},
+    sample::Bool=false, 
+    max_length::Int=15
+)::Tuple{Bool, Union{Vector{Tuple{String, String}}, Nothing}}
     # Initialize empty stack with start symbol 'S'
     stack = ["S"]
     
@@ -170,7 +197,7 @@ function logits_to_prods(logits::Matrix{Float32}, sample::Bool=false, max_length
         
         # Get mask for current symbol
         symbol_idx = findfirst(==(alpha), unique_lhs)
-        mask = masks[symbol_idx, :]
+        mask = grammar_masks[symbol_idx, :]
         
         # Calculate probabilities
         probs = mask .* exp.(logits_prods[t, :])
@@ -233,6 +260,11 @@ function prods_to_tree(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{Stri
     return tree
 end
 
+"""
+Taken productions in the form (lhs, rhs) and convert prefix list of nodes with op index. lhs, rhs are strings (from GRAMMAR).
+
+Needs mapping from (op_deg, op_idx) -> token_idx.
+"""
 function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, feature::Int)::Vector{Node{Float64}}
     prefix_list = []
     for prod in prods
