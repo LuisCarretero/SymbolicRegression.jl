@@ -100,36 +100,35 @@ function set_config_and_ops(options::AbstractOptions)
     
     try
         ops = [options.operators.binops..., options.operators.unaops...]
+        @info("ops: $ops")
         # Assert all required operators are present. FIXME: Make this dynamic, dependent on loaded sampling model
-        @assert (+) in ops "Addition operator not found in options"
-        @assert (-) in ops "Subtraction operator not found in options"
-        @assert (*) in ops "Multiplication operator not found in options"
-        @assert (/) in ops "Division operator not found in options"
-        @assert sin in ops "Sine operator not found in options"
-        @assert cos in ops "Cosine operator not found in options"
-        @assert exp in ops "Exponential operator not found in options"
-        @assert zero_sqrt in ops "Zero sqrt operator not found in options"
+        function check_op(op_name, ops)
+            any(op -> string(op) == op_name, ops) || error("$op_name operator not found in options")
+        end
+        check_op("+", ops)
+        check_op("-", ops)
+        check_op("*", ops)
+        check_op("/", ops)
+        check_op("sin", ops)
+        check_op("cos", ops)
+        check_op("exp", ops)
+        check_op("zero_sqrt", ops)
 
         # @assert tanh in ops "Hyperbolic tangent operator not found in options"
         # @assert cosh in ops "Hyperbolic cosine operator not found in options"
         # @assert sinh in ops "Hyperbolic sine operator not found in options"
 
         @assert length(ops) == (CFG_REF[].nbin + CFG_REF[].nuna) "Additional operators not found in options: $ops"
-        
         # Mapping operator string to SR.jl op index (1-indexed for each arity)
         op_index = Dict{String, Int}(
-            "ADD" => findfirst(==(+), ops),
-            "SUB" => findfirst(==(-), ops), 
-            "MUL" => findfirst(==(*), ops),
-            "DIV" => findfirst(==(/), ops),
-
-            "SIN" => findfirst(==(sin), ops) - (CFG_REF[].nbin),
-            "COS" => findfirst(==(cos), ops) - (CFG_REF[].nbin),
-            "EXP" => findfirst(==(exp), ops) - (CFG_REF[].nbin),
-            "ZERO_SQRT" => findfirst(==(zero_sqrt), ops) - (CFG_REF[].nbin),
-            # "TANH" => findfirst(==(tanh), ops) - (CFG_REF[].nbin),
-            # "COSH" => findfirst(==(cosh), ops) - (CFG_REF[].nbin),
-            # "SINH" => findfirst(==(sinh), ops) - (CFG_REF[].nbin),
+            "ADD" => findfirst(op -> string(op) == "+", ops),
+            "SUB" => findfirst(op -> string(op) == "-", ops),
+            "MUL" => findfirst(op -> string(op) == "*", ops),
+            "DIV" => findfirst(op -> string(op) == "/", ops),
+            "SIN" => findfirst(op -> string(op) == "sin", ops) - (CFG_REF[].nbin),
+            "COS" => findfirst(op -> string(op) == "cos", ops) - (CFG_REF[].nbin),
+            "EXP" => findfirst(op -> string(op) == "exp", ops) - (CFG_REF[].nbin),
+            "ZERO_SQRT" => findfirst(op -> string(op) == "zero_sqrt", ops) - (CFG_REF[].nbin),
         )
         @assert maximum(values(op_index)) == maximum([CFG_REF[].nbin,  CFG_REF[].nuna]) "Operator index out of bounds"
         
