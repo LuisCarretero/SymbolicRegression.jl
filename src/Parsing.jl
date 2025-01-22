@@ -222,6 +222,10 @@ function logits_to_prods(  # FIXME: Think of better way than to just use global 
         lhs, rhs = split(strip(rule), "->")
         lhs = strip(lhs)
         rhs = strip(rhs)
+
+        if lhs == "END"
+            break
+        end
         
         # If rule produces CONST, replace with actual constant
         if rhs == "'CON'"

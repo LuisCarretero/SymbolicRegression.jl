@@ -6,6 +6,16 @@ using DynamicExpressions: AbstractExpressionNode, AbstractExpression, NodeSample
 using ..CoreModule: AbstractOptions, DATA_TYPE
 using ..ParsingModule: nn_config, node_to_onehot, logits_to_prods, prods_to_tree, select_viable_subtree, count_nodes, OPERATOR_ARITY
 
+# Add CUDA imports at module level
+const CUDA_AVAILABLE = Ref{Bool}(false)
+try
+    using CUDA
+    using cuDNN
+    global CUDA_AVAILABLE[] = true
+catch
+    global CUDA_AVAILABLE[] = false
+end
+
 export neural_mutate_tree
 
 const MODEL_REF = Ref{Union{Nothing, ORT.InferenceSession}}(nothing)
@@ -158,10 +168,9 @@ end
 
 function load_model(options::AbstractOptions)
     if options.neural_options.device == "cuda"
-        cuda_success = load_optional_cuda(options)
-        if cuda_success
-            @info "CUDA package loaded successfully."
-        else
+        if CUDA_AVAILABLE[]
+            @info "CUDA available. Loading model on GPU."    
+        else 
             @warn "CUDA package not available. Falling back to CPU."
             options.neural_options.device = "cpu"
         end
@@ -169,21 +178,21 @@ function load_model(options::AbstractOptions)
     MODEL_REF[] = ORT.load_inference(options.neural_options.model_path, execution_provider=Symbol(options.neural_options.device))
 end
 
-function load_optional_cuda(options::AbstractOptions)
-    try
-        # Only evaluate this if we want CUDA
-        @eval begin
-            # CUDA.set_runtime_version!(v"12.6")
-            import CUDA, cuDNN
-            return true
-        end
-    catch e
-        if options.neural_options.verbose
-            @error "CUDA initialization failed" exception=(e, catch_backtrace())
-        end
-        return false
-    end
-end
+# function load_optional_cuda(options::AbstractOptions)
+#     try
+#         # Only evaluate this if we want CUDA
+#         @eval begin
+#             # CUDA.set_runtime_version!(v"12.6")
+#             import CUDA, cuDNN
+#             return true
+#         end
+#     catch e
+#         if options.neural_options.verbose
+#             @error "CUDA initialization failed" exception=(e, catch_backtrace())
+#         end
+#         return false
+#     end
+# end
 
 """
     sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
