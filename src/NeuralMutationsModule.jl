@@ -78,7 +78,7 @@ function get_mutation_stats()
     return STATS_REF[]
 end
 
-function set_config_and_ops(options::AbstractOptions)
+function setup_module(options::AbstractOptions)
     OPTIONS_REF[] = options
 
     if !options.neural_options.active
@@ -87,7 +87,7 @@ function set_config_and_ops(options::AbstractOptions)
         return
     end
     @info "Initializing sampling model."
-    MODEL_REF[] = ORT.load_inference(options.neural_options.model_path)
+    load_model(options)
 
     # nn_config and supported operators are NN-specific and cannot be changed for now. TODO: Infer this from model 
     # (no need to specify as it only works if it agrees with model anyways)
@@ -156,6 +156,35 @@ function set_config_and_ops(options::AbstractOptions)
     end
 end
 
+function load_model(options::AbstractOptions)
+    if options.neural_options.device == "cuda"
+        cuda_success = load_optional_cuda(options)
+        if cuda_success
+            @info "CUDA package loaded successfully."
+        else
+            @warn "CUDA package not available. Falling back to CPU."
+            options.neural_options.device = "cpu"
+        end
+    end
+    MODEL_REF[] = ORT.load_inference(options.neural_options.model_path, execution_provider=Symbol(options.neural_options.device))
+end
+
+function load_optional_cuda(options::AbstractOptions)
+    try
+        # Only evaluate this if we want CUDA
+        @eval begin
+            # CUDA.set_runtime_version!(v"12.6")
+            import CUDA, cuDNN
+            return true
+        end
+    catch e
+        if options.neural_options.verbose
+            @error "CUDA initialization failed" exception=(e, catch_backtrace())
+        end
+        return false
+    end
+end
+
 """
     sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
 
@@ -205,7 +234,7 @@ function neural_mutate_tree(
     options::AbstractOptions,
     rng::AbstractRNG=default_rng(),
 ) where {T}
-    OPTIONS_REF[] !== options && set_config_and_ops(options)
+    OPTIONS_REF[] !== options && setup_module(options)
     
     increment_stats!(STATS_REF[], :total_attempts, true)
     if !ENABLED_REF[]

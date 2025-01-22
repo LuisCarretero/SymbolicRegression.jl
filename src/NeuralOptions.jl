@@ -6,6 +6,8 @@ Base.@kwdef mutable struct NeuralOptions
     subtree_min_nodes::Int = 5
     subtree_max_nodes::Int = 14
     model_path::String = ""
+    verbose::Bool = false
+    device::String = "cpu"  # TODO: Make this symbol? But needs to work with Python interface.
 end
 
 function validate_neural_options(options::NeuralOptions)
