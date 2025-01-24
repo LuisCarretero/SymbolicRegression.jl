@@ -32,23 +32,36 @@ zero_sqrt(x) = x >= 0 ? sqrt(x) : zero(x)
 mutable struct NeuralMutationStats
     total_attempts::Int
     successful_mutations::Int
-    no_subtree_found::Int
     module_not_enabled::Int
+    no_subtree_found::Int
+    sample_routine_failures::Int
+    total_samples::Int
     encoding_failures::Int
     decoding_failures::Int
     tree_build_failures::Int
+    tree_comparison_failures::Int
+    # Tree sizes
     total_tree_sizes::Vector{Int}
     subtree_in_sizes::Vector{Int}
     subtree_out_sizes::Vector{Int}
 
     function NeuralMutationStats(
-        total_attempts=0,
+        total_attempts=0,  # Overall methods calls
         successful_mutations=0,
-        no_subtree_found=0,
         module_not_enabled=0,
-        encoding_failures=0,
+        no_subtree_found=0,
+        sample_routine_failures=0,  # Failed to sample new subtree
+        
+        total_samples=0,  # Total samples from neural network (multiple per neural_mutate() call possible)
+
+        encoding_failures=0,  # Following are issues during sampling routine
         decoding_failures=0,
-        tree_build_failures=0
+        tree_build_failures=0,
+        tree_comparison_failures=0,
+        
+        total_tree_sizes=Int[],  # For successfull mutations: Sizes
+        subtree_in_sizes=Int[],
+        subtree_out_sizes=Int[]
     )
         new(
             total_attempts,
@@ -58,9 +71,12 @@ mutable struct NeuralMutationStats
             encoding_failures,
             decoding_failures,
             tree_build_failures,
-            Int[],  # Initialize empty vectors
-            Int[],
-            Int[]
+            tree_comparison_failures,
+            sample_routine_failures,
+            total_samples,
+            total_tree_sizes,
+            subtree_in_sizes,
+            subtree_out_sizes
         )
     end
 end
@@ -178,22 +194,6 @@ function load_model(options::AbstractOptions)
     MODEL_REF[] = ORT.load_inference(options.neural_options.model_path, execution_provider=Symbol(options.neural_options.device))
 end
 
-# function load_optional_cuda(options::AbstractOptions)
-#     try
-#         # Only evaluate this if we want CUDA
-#         @eval begin
-#             # CUDA.set_runtime_version!(v"12.6")
-#             import CUDA, cuDNN
-#             return true
-#         end
-#     catch e
-#         if options.neural_options.verbose
-#             @error "CUDA initialization failed" exception=(e, catch_backtrace())
-#         end
-#         return false
-#     end
-# end
-
 """
     sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
 
@@ -251,33 +251,18 @@ function neural_mutate_tree(
         return tree
     end
 
-    # Select a viable subtree to mutate
+    # Select a viable subtree to mutate FIXME: Could also try different tree if this one isn't successfull
     found_subtree, subtree, parent, feature = select_viable_subtree(tree, options.neural_options.subtree_min_nodes, options.neural_options.subtree_max_nodes)
     if !found_subtree
         increment_stats!(STATS_REF[], :no_subtree_found, true)
         return tree
     end
-    
-    # Encode the subtree into a one-hot vector
-    encode_success, x = node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[])
-    if !encode_success
-        increment_stats!(STATS_REF[], :encoding_failures, true)
-        return tree
-    end
-    
-    # Sample new subtree
-    x_out = sample_logits(x, options.neural_options.sampling_eps)
-    success, prods = logits_to_prods(x_out, true)
-    if !success
-        increment_stats!(STATS_REF[], :decoding_failures, true)
-        return tree
-    end
 
-    success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
+    success, new_subtree = sample_routine(subtree, feature, options)
     if !success
-        increment_stats!(STATS_REF[], :tree_build_failures, true)
+        increment_stats!(STATS_REF[], :sample_routine_failures, true)
         return tree
-    end 
+    end
 
     lock(STATS_LOCK) do
         add_to_stats!(STATS_REF[], :total_tree_sizes, false, count_nodes(tree))
@@ -287,20 +272,79 @@ function neural_mutate_tree(
     end
     
     # Replace the old subtree with the new one
-    if parent === nothing
-        return new_subtree
-    else
-        if parent.degree == 1
-            parent.l = new_subtree
-        elseif parent.degree == 2
-            if parent.l === subtree
-                parent.l = new_subtree
-            else
-                parent.r = new_subtree
-            end
+    return replace_subtree(tree, parent, subtree, new_subtree)
+end
+
+"""
+    sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}} where {T}
+
+Sample a new subtree from the neural network. Includes encoding, sampling and decoding. 
+Can possibly have multiple attempts to sample a new subtree if the first one fails.
+
+Add: Could use attemp to be more lenient as we come closer to failing otherwise.
+"""
+function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}} where {T}
+    
+    for attempt in 1:(options.neural_options.max_resamples+1)
+        increment_stats!(STATS_REF[], :total_samples, true)
+
+        # Encode the subtree into a one-hot vector
+        encode_success, x = node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[])
+        if !encode_success
+            increment_stats!(STATS_REF[], :encoding_failures, true)
+            continue
         end
-        return tree
+        
+        # Sample new subtree
+        x_out = sample_logits(x, options.neural_options.sampling_eps)
+        success, prods = logits_to_prods(x_out, true)
+        if !success
+            increment_stats!(STATS_REF[], :decoding_failures, true)
+            continue
+        end
+
+        success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature)
+        if !success
+            increment_stats!(STATS_REF[], :tree_build_failures, true)
+            continue
+        end 
+
+        good = compare_sampled_tree(subtree, new_subtree, options)
+        if !good
+            increment_stats!(STATS_REF[], :tree_comparison_failures, true)
+            continue
+        end
+        return true, new_subtree
     end
+    return false, subtree
+end
+
+"""
+Function for all comparisons between old and new subtree. 
+"""
+function compare_sampled_tree(subtree::AbstractExpressionNode{T1}, new_subtree::AbstractExpressionNode{T2}, options::AbstractOptions) where {T1,T2}
+    is_good = true
+    if options.neural_options.max_tree_size_diff != 0
+        is_good &= abs(count_nodes(new_subtree) - count_nodes(subtree)) <= options.neural_options.max_tree_size_diff
+    end
+    return is_good
+end
+
+function replace_subtree(tree::AbstractExpressionNode{T}, parent::Union{AbstractExpressionNode{T}, Nothing}, subtree::AbstractExpressionNode{T}, new_subtree::AbstractExpressionNode{T}) where {T}
+    if parent === nothing # We sampled the whole tree, no insertion needed
+        return new_subtree
+    end
+    
+    if parent.degree == 1
+        parent.l = new_subtree
+    elseif parent.degree == 2
+        if parent.l === subtree
+            parent.l = new_subtree
+        else
+            parent.r = new_subtree
+        end
+    end
+    return tree
 end
 
 end

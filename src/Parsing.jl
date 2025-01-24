@@ -259,9 +259,9 @@ function prods_to_tree(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{Stri
     # Depending on arity, create 0, 1 or 2 children
     # 
     prefix_list = _prods_to_prefix(prods, OP_INDEX, feature)
-    tree = _prefix_to_tree!(prefix_list)
+    tree, success = _prefix_to_tree!(prefix_list)
 
-    return tree
+    return tree, success
 end
 
 """
@@ -301,18 +301,18 @@ function _make_childless_op(degree::Int, op_index::Int, ::Type{T})::Node{T} wher
     return op_node
 end
 
-function build_subtree(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}}} where {T<:Number}
-    isempty(prefix_list) && return false, Node{T}()
+function _build_subtree(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}}} where {T<:Number}
+    isempty(prefix_list) && return false, Node{T}()  # If prefix_list is empty initially or children are created but prefix_list stack is empty.
 
     node = popfirst!(prefix_list)
     success = true
     if node.degree == 0
         # Leaf node, no children to add
     elseif node.degree == 1
-        success, node.l = build_subtree(prefix_list)
+        success, node.l = _build_subtree(prefix_list)
     elseif node.degree == 2
-        success1, node.l = build_subtree(prefix_list)
-        success2, node.r = build_subtree(prefix_list)
+        success1, node.l = _build_subtree(prefix_list)
+        success2, node.r = _build_subtree(prefix_list)
         success = success1 && success2
     else
         error("Prefix_to_tree: Invalid node degree: $(node.degree)")
@@ -326,7 +326,7 @@ Copied from datagen/ExpressionGenerator.jl. Consolidate.
 First flag is ``success``, second flag is ``node``.
 """
 function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}, Nothing}} where {T<:Number}
-    return build_subtree(prefix_list)
+    return _build_subtree(prefix_list)
 end
 
 
@@ -349,8 +349,18 @@ The function works by:
 1. Computing descendant counts and feature sets for each node
 2. Finding all valid subtrees that meet the criteria
 3. Randomly selecting one valid subtree
+
+Returns:
+- success: Boolean indicating if a valid subtree was found
+- node: The selected subtree node
+- parent: The parent node of the selected subtree (or nothing if root)
+- feature: The feature number used in the subtree
 """
-function select_viable_subtree(tree::Node{T}, min_nodes::Int, max_nodes::Int) where T<:Number
+function select_viable_subtree(
+    tree::Node{T}, 
+    min_nodes::Int, 
+    max_nodes::Int
+)::Tuple{Bool, Union{Node{T}, Nothing}, Union{Node{T}, Nothing}, Union{Int, Nothing}} where T<:Number
     # Store descendant count and feature set for each node
     desc_counts = Dict{Node{T}, Int}() 
     feature_sets = Dict{Node{T}, Set{Int}}()

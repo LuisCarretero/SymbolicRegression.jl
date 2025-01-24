@@ -8,6 +8,10 @@ Base.@kwdef mutable struct NeuralOptions
     model_path::String = ""
     verbose::Bool = false
     device::String = "cpu"  # TODO: Make this symbol? But needs to work with Python interface.
+
+
+    max_resamples::Int = 10
+    max_tree_size_diff::Int = 1
 end
 
 function validate_neural_options(options::NeuralOptions)
