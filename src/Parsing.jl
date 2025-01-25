@@ -253,15 +253,20 @@ function logits_to_prods(  # FIXME: Think of better way than to just use global 
     return true, prods
 end
 
-function prods_to_tree(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, feature::Int)
+function prods_to_tree(
+    prods::Vector{Tuple{String, String}}, 
+    OP_INDEX::Dict{String, Int}, 
+    feature::Int, 
+    tree_type::Type{T}
+)::Tuple{Bool, Union{Node{T}, Nothing}} where {T <: Number}
     # global prods stack
     # Create node for each production
     # Depending on arity, create 0, 1 or 2 children
     # 
-    prefix_list = _prods_to_prefix(prods, OP_INDEX, feature)
-    tree, success = _prefix_to_tree!(prefix_list)
+    prefix_list = _prods_to_prefix(prods, OP_INDEX, feature, tree_type)
+    success, tree = _prefix_to_tree!(prefix_list)
 
-    return tree, success
+    return success, tree
 end
 
 """
@@ -269,7 +274,7 @@ Taken productions in the form (lhs, rhs) and convert prefix list of nodes with o
 
 Needs mapping from (op_deg, op_idx) -> token_idx.
 """
-function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, feature::Int)::Vector{Node{Float64}}
+function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, feature::Int, tree_type::Type{T})::Vector{Node{T}} where {T <: Number}
     prefix_list = []
     for prod in prods
         op_match = match(r"'([^']+)'", prod[2])  # Alternatively, use prod to infer arity?
@@ -277,14 +282,14 @@ function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{S
             op = op_match.captures[1]
             arity = OPERATOR_ARITY[op]
             if arity == 0
-                push!(prefix_list, Node{Float64}(; feature=feature))  # FIXME: Only univariate for now
+                push!(prefix_list, Node{T}(; feature=feature))  # FIXME: Only univariate for now
             elseif arity == 1
-                push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], Float64))
+                push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], T))
             elseif arity == 2
-                push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], Float64))
+                push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], T))
             end
         else  # Constant
-            push!(prefix_list, Node{Float64}(; val=parse(Float64, prod[2])))
+            push!(prefix_list, Node{T}(; val=parse(T, prod[2])))
         end
     end
     return prefix_list

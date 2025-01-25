@@ -12,6 +12,10 @@ Base.@kwdef mutable struct NeuralOptions
 
     max_resamples::Int = 10
     max_tree_size_diff::Int = 1
+    require_tree_size_similarity::Bool = true
+    require_novel_skeleton::Bool = true
+    require_expr_similarity::Bool = true
+    similarity_threshold::Float64 = 0.2
 end
 
 function validate_neural_options(options::NeuralOptions)
