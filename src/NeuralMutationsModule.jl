@@ -288,7 +288,7 @@ function neural_mutate_tree(
         return tree
     end
 
-    success, new_subtree = sample_routine(subtree, feature, options)
+    success, new_subtree, mse = sample_routine(subtree, feature, options)
     if !success
         increment_stats!(STATS_REF[], :sample_routine_failures, true)
         return tree
@@ -298,6 +298,9 @@ function neural_mutate_tree(
         add_to_stats!(STATS_REF[], :total_tree_sizes, false, count_nodes(tree))
         add_to_stats!(STATS_REF[], :subtree_in_sizes, false, count_nodes(subtree))
         add_to_stats!(STATS_REF[], :subtree_out_sizes, false, count_nodes(new_subtree))
+        if options.neural_options.require_expr_similarity
+            add_to_stats!(STATS_REF[], :sampled_mse, false, mse)
+        end
         if options.neural_options.log_subtree_strings
             add_to_stats!(STATS_REF[], :orig_subtree_string, false, string_tree(subtree, options))
             add_to_stats!(STATS_REF[], :new_subtree_string, false, string_tree(new_subtree, options))
@@ -317,7 +320,7 @@ Can possibly have multiple attempts to sample a new subtree if the first one fai
 
 Add: Could use attemp to be more lenient as we come closer to failing otherwise.
 """
-function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}} where {T}
+function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}, Float64} where {T}
     
     # Keep track of candidates that pass all checks except similarity
     candidates = Vector{Tuple{AbstractExpressionNode{T}, Float64}}()
@@ -328,7 +331,7 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
     encode_success, x_in = node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[])
     if !encode_success
         increment_stats!(STATS_REF[], :encoding_failures, true)
-        return false, subtree
+        return false, subtree, Inf
     end
 
     for attempt in 1:(options.neural_options.max_resamples+1)
@@ -378,26 +381,25 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
             if is_similar  # This is the best case: We found a similar expression that (if required above) is novel
                 # println("Found similar expression with MSE: $mse")
                 increment_stats!(STATS_REF[], :returned_similar_exprs, true)
-                add_to_stats!(STATS_REF[], :sampled_mse, false, mse)
-                return true, new_subtree
+                return true, new_subtree, mse
             else
                 increment_stats!(STATS_REF[], :expr_similarity_failures, true)
                 push!(candidates, (new_subtree, mse))
             end
         else
-            return true, new_subtree
+            return true, new_subtree, Inf
         end
     end
 
     # If we have candidates that failed only the similarity check, return the best one
     if !isempty(candidates)
         best_candidate = argmin(c -> c[2], candidates)
+        new_subtree, mse = best_candidate
         increment_stats!(STATS_REF[], :returned_nonsimilar_exprs, true)
-        add_to_stats!(STATS_REF[], :sampled_mse, false, best_candidate[2])
-        return true, best_candidate[1]
+        return true, new_subtree, mse
     end
     
-    return false, subtree
+    return false, subtree, Inf
 end
 
 function check_expr_similarity(
