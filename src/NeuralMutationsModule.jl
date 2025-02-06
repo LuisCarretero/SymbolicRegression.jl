@@ -2,7 +2,7 @@ module NeuralMutationsModule
 
 using Random: default_rng, AbstractRNG
 import ONNXRunTime as ORT
-using DynamicExpressions: AbstractExpressionNode, AbstractExpression, NodeSampler, has_operators, with_contents, get_contents, eval_tree_array
+using DynamicExpressions: AbstractExpressionNode, AbstractExpression, NodeSampler, has_operators, with_contents, get_contents, eval_tree_array, string_tree
 using ..CoreModule: AbstractOptions, DATA_TYPE
 using ..ParsingModule: nn_config, node_to_onehot, logits_to_prods, prods_to_tree, select_viable_subtree, count_nodes, OPERATOR_ARITY
 
@@ -53,6 +53,10 @@ mutable struct NeuralMutationStats
     subtree_in_sizes::Vector{Int}
     subtree_out_sizes::Vector{Int}
 
+    # Tree eval
+    orig_subtree_string::Vector{String}
+    new_subtree_string::Vector{String}
+
     # MSEs
     sampled_mse::Vector{Float32}
 
@@ -78,7 +82,9 @@ mutable struct NeuralMutationStats
         total_tree_sizes=Int[],  # For successfull mutations: Sizes
         subtree_in_sizes=Int[],
         subtree_out_sizes=Int[],
-        sampled_mse=Float32[]
+        sampled_mse=Float32[],
+        orig_subtree_string=String[],
+        new_subtree_string=String[]
     )
         new(
             total_attempts,
@@ -101,14 +107,16 @@ mutable struct NeuralMutationStats
             total_tree_sizes,
             subtree_in_sizes,
             subtree_out_sizes,
-            sampled_mse
+            sampled_mse,
+            orig_subtree_string,
+            new_subtree_string
         )
     end
 end
 
 const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats())
 
-function add_to_stats!(stats::NeuralMutationStats, type::Symbol, with_lock::Bool, value::Number)
+function add_to_stats!(stats::NeuralMutationStats, type::Symbol, with_lock::Bool, value)
     with_lock && lock(STATS_LOCK)
     vec = getfield(stats, type)
     push!(vec, value)
@@ -164,10 +172,6 @@ function setup_module(options::AbstractOptions)
         check_op("cos", ops)
         check_op("exp", ops)
         check_op("zero_sqrt", ops)
-
-        # @assert tanh in ops "Hyperbolic tangent operator not found in options"
-        # @assert cosh in ops "Hyperbolic cosine operator not found in options"
-        # @assert sinh in ops "Hyperbolic sine operator not found in options"
 
         @assert length(ops) == (CFG_REF[].nbin + CFG_REF[].nuna) "Additional operators not found in options: $ops"
         # Mapping operator string to SR.jl op index (1-indexed for each arity)
@@ -267,7 +271,7 @@ end
 function neural_mutate_tree(
     tree::AbstractExpressionNode{T},
     options::AbstractOptions,
-    rng::AbstractRNG=default_rng(),
+    rng::AbstractRNG=default_rng()
 ) where {T}
     OPTIONS_REF[] !== options && setup_module(options)
     
@@ -294,6 +298,10 @@ function neural_mutate_tree(
         add_to_stats!(STATS_REF[], :total_tree_sizes, false, count_nodes(tree))
         add_to_stats!(STATS_REF[], :subtree_in_sizes, false, count_nodes(subtree))
         add_to_stats!(STATS_REF[], :subtree_out_sizes, false, count_nodes(new_subtree))
+        if options.neural_options.log_subtree_strings
+            add_to_stats!(STATS_REF[], :orig_subtree_string, false, string_tree(subtree, options))
+            add_to_stats!(STATS_REF[], :new_subtree_string, false, string_tree(new_subtree, options))
+        end
         increment_stats!(STATS_REF[], :successful_mutations, false)
     end
     
@@ -335,7 +343,7 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
         end
         x_out = x_out_batch[current_sample_idx, :, :]
 
-        success, prods = logits_to_prods(x_out, true)
+        success, prods = logits_to_prods(x_out, options.neural_options.sample_logits)
         if !success
             increment_stats!(STATS_REF[], :decoding_failures, true)
             continue
@@ -409,11 +417,11 @@ function check_expr_similarity(
         good = complete && all((res .< prevfloat(typemax(Float32))) .& (res .> nextfloat(typemin(Float32)))) && !any(isnan, res) && !any(isinf, res)
         if !good
             increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
-            return false, 0.0
+            return false, Inf
         end
     catch e
         increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
-        return false, 0.0
+        return false, Inf
     end
     
 
@@ -422,15 +430,15 @@ function check_expr_similarity(
         good_new = complete_new && all((res_new .< prevfloat(typemax(Float32))) .& (res_new .> nextfloat(typemin(Float32)))) && !any(isnan, res_new) && !any(isinf, res_new)
         if !good_new
             increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
-            return false, 0.0
+            return false, Inf
         end
     catch e
         increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
-        return false, 0.0
+        return false, Inf
     end
 
     # Calculate MSE
-    mse = sum((asinh.(res) - asinh.(res_new)).^2) / length(x)
+    mse = sum((asinh.(res) - asinh.(res_new)).^2) / length(x)  # FIXME: Make this MSE metric parameter
     return mse < options.neural_options.similarity_threshold, mse
 end
 

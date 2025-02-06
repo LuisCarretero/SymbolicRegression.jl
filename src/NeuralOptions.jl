@@ -6,9 +6,7 @@ Base.@kwdef mutable struct NeuralOptions
     subtree_min_nodes::Int = 5
     subtree_max_nodes::Int = 14
     model_path::String = ""
-    verbose::Bool = false
     device::String = "cpu"  # TODO: Make this symbol? But needs to work with Python interface.
-
 
     max_resamples::Int = 10  # Set (1+max_resamples) to a multiple of sample_batchsize
     max_tree_size_diff::Int = 1
@@ -17,6 +15,11 @@ Base.@kwdef mutable struct NeuralOptions
     require_expr_similarity::Bool = true
     similarity_threshold::Float64 = 0.2
     sample_batchsize::Int = 10  # 
+    sample_logits::Bool = true  # If false, use argmax to sample.
+
+    # Loggings
+    verbose::Bool = false
+    log_subtree_strings::Bool = false
 end
 
 function validate_neural_options(options::NeuralOptions)
