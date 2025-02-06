@@ -220,14 +220,15 @@ function load_model(options::AbstractOptions)
 end
 
 """
-    sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
+    sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_count::Int=1)::AbstractArray{Float32}
 
 Sample the logits of the neural network.
+Currently assuming single sample as input and then sample_count samples as output.
 """
-function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01)::AbstractArray{Float32}
-    input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [eps])
+function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_count::Int=1)::AbstractArray{Float32}
+    input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [eps], "onnx::Reshape_2" => [sample_count])
     raw_out = MODEL_REF[](input)
-    x_out = raw_out["276"][1, :, :]
+    x_out = raw_out["314"]  # [1, :, :]  FIXME: Fix this naming
     return x_out
 end
 
@@ -312,6 +313,8 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
     
     # Keep track of candidates that pass all checks except similarity
     candidates = Vector{Tuple{AbstractExpressionNode{T}, Float64}}()
+    current_sample_idx = Inf
+    x_out_batch = nothing
 
     # Encode the subtree into a one-hot vector
     encode_success, x_in = node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[])
@@ -319,12 +322,19 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
         increment_stats!(STATS_REF[], :encoding_failures, true)
         return false, subtree
     end
-    
+
     for attempt in 1:(options.neural_options.max_resamples+1)
         increment_stats!(STATS_REF[], :total_samples, true)
         
-        # Sample new subtree
-        x_out = sample_logits(x_in, options.neural_options.sampling_eps)
+        # Grab new output  TODO: Make this an object or somehow outsource current_sample_idx 
+        if current_sample_idx >= options.neural_options.sample_batchsize  # Used last sample from batch: Resample.
+            x_out_batch = sample_logits(x_in, options.neural_options.sampling_eps, options.neural_options.sample_batchsize)
+            current_sample_idx = 1
+        else  # Still have samples left in batch: Use this.
+            current_sample_idx += 1
+        end
+        x_out = x_out_batch[current_sample_idx, :, :]
+
         success, prods = logits_to_prods(x_out, true)
         if !success
             increment_stats!(STATS_REF[], :decoding_failures, true)
