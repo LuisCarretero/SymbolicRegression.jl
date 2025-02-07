@@ -1,6 +1,7 @@
 module ParsingModule
 
-import SymbolicRegression: Node
+using SymbolicRegression: Node
+using ..CoreModule: AbstractOptions
 using Distributions: Categorical
 
 # Define grammar rules similar to Python version
@@ -256,16 +257,11 @@ end
 function prods_to_tree(
     prods::Vector{Tuple{String, String}}, 
     OP_INDEX::Dict{String, Int}, 
-    feature::Int, 
+    features::Vector{Int}, 
     tree_type::Type{T}
 )::Tuple{Bool, Union{Node{T}, Nothing}} where {T <: Number}
-    # global prods stack
-    # Create node for each production
-    # Depending on arity, create 0, 1 or 2 children
-    # 
-    prefix_list = _prods_to_prefix(prods, OP_INDEX, feature, tree_type)
+    prefix_list = _prods_to_prefix(prods, OP_INDEX, features, tree_type)
     success, tree = _prefix_to_tree!(prefix_list)
-
     return success, tree
 end
 
@@ -274,15 +270,17 @@ Taken productions in the form (lhs, rhs) and convert prefix list of nodes with o
 
 Needs mapping from (op_deg, op_idx) -> token_idx.
 """
-function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, feature::Int, tree_type::Type{T})::Vector{Node{T}} where {T <: Number}
+function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, features::Vector{Int}, tree_type::Type{T})::Vector{Node{T}} where {T <: Number}
     prefix_list = []
+    i = 1
     for prod in prods
         op_match = match(r"'([^']+)'", prod[2])  # Alternatively, use prod to infer arity?
         if op_match !== nothing
             op = op_match.captures[1]
             arity = OPERATOR_ARITY[op]
             if arity == 0
-                push!(prefix_list, Node{T}(; feature=feature))  # FIXME: Only univariate for now
+                push!(prefix_list, Node{T}(; feature=features[i]))
+                i += 1
             elseif arity == 1
                 push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], T))
             elseif arity == 2
@@ -338,7 +336,7 @@ end
 
 
 """
-    select_viable_subtree(tree::Node{T}, min_nodes::Int, max_nodes::Int) where T<:Number
+    select_viable_subtree(tree::Node{T}, options::AbstractOptions) where T<:Number
 
 Analyzes a tree to find valid subtrees for mutation. A valid subtree must:
 - Have between min_nodes and max_nodes total nodes
@@ -363,9 +361,8 @@ Returns:
 """
 function select_viable_subtree(
     tree::Node{T}, 
-    min_nodes::Int, 
-    max_nodes::Int
-)::Tuple{Bool, Union{Node{T}, Nothing}, Union{Node{T}, Nothing}, Union{Int, Nothing}} where T<:Number
+    options::AbstractOptions
+)::Tuple{Bool, Union{Node{T}, Nothing}, Union{Node{T}, Nothing}, Union{Set{Int}, Nothing}} where T<:Number
     # Store descendant count and feature set for each node
     desc_counts = Dict{Node{T}, Int}() 
     feature_sets = Dict{Node{T}, Set{Int}}()
@@ -410,8 +407,9 @@ function select_viable_subtree(
         count = desc_counts[node]
         features = feature_sets[node]
         
-        if min_nodes <= count <= max_nodes && length(features) == 1
-            push!(valid_subtrees, (node, parent, first(features)))
+        if options.neural_options.subtree_min_nodes <= count <= options.neural_options.subtree_max_nodes &&
+            length(features) <= options.neural_options.subtree_max_features
+            push!(valid_subtrees, (node, parent, features))
         end
         
         if node.degree >= 1
@@ -424,7 +422,7 @@ function select_viable_subtree(
     
     check_node(tree, nothing)
     
-    isempty(valid_subtrees) && return (false, tree, nothing, 0)
+    isempty(valid_subtrees) && return (false, tree, nothing, Set{Int}())
     
     # Randomly select one valid subtree
     selected = rand(valid_subtrees)

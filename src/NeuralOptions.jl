@@ -16,6 +16,7 @@ Base.@kwdef mutable struct NeuralOptions
     similarity_threshold::Float64 = 0.2
     sample_batchsize::Int = 10  # 
     sample_logits::Bool = true  # If false, use argmax to sample.
+    subtree_max_features::Int = 1
 
     # Loggings
     verbose::Bool = false

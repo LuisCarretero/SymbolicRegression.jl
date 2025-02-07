@@ -2,6 +2,7 @@ module NeuralMutationsModule
 
 using Random: default_rng, AbstractRNG
 import ONNXRunTime as ORT
+using Distributions: Uniform
 using DynamicExpressions: AbstractExpressionNode, AbstractExpression, NodeSampler, has_operators, with_contents, get_contents, eval_tree_array, string_tree
 using ..CoreModule: AbstractOptions, DATA_TYPE
 using ..ParsingModule: nn_config, node_to_onehot, logits_to_prods, prods_to_tree, select_viable_subtree, count_nodes, OPERATOR_ARITY
@@ -60,6 +61,9 @@ mutable struct NeuralMutationStats
     # MSEs
     sampled_mse::Vector{Float32}
 
+    # Multivariate decoding stats
+    multivariate_decoding_attempts::Int
+
     function NeuralMutationStats(
         total_attempts=0,  # Overall methods calls
         successful_mutations=0,
@@ -84,7 +88,8 @@ mutable struct NeuralMutationStats
         subtree_out_sizes=Int[],
         sampled_mse=Float32[],
         orig_subtree_string=String[],
-        new_subtree_string=String[]
+        new_subtree_string=String[],
+        multivariate_decoding_attempts=0
     )
         new(
             total_attempts,
@@ -109,7 +114,8 @@ mutable struct NeuralMutationStats
             subtree_out_sizes,
             sampled_mse,
             orig_subtree_string,
-            new_subtree_string
+            new_subtree_string,
+            multivariate_decoding_attempts
         )
     end
 end
@@ -282,13 +288,13 @@ function neural_mutate_tree(
     end
 
     # Select a viable subtree to mutate FIXME: Could also try different tree if this one isn't successfull
-    found_subtree, subtree, parent, feature = select_viable_subtree(tree, options.neural_options.subtree_min_nodes, options.neural_options.subtree_max_nodes)
+    found_subtree, subtree, parent, feature_set = select_viable_subtree(tree, options)
     if !found_subtree
         increment_stats!(STATS_REF[], :no_subtree_found, true)
         return tree
     end
 
-    success, new_subtree, mse = sample_routine(subtree, feature, options)
+    success, new_subtree, mse = sample_routine(subtree, feature_set, options)
     if !success
         increment_stats!(STATS_REF[], :sample_routine_failures, true)
         return tree
@@ -318,9 +324,11 @@ end
 Sample a new subtree from the neural network. Includes encoding, sampling and decoding. 
 Can possibly have multiple attempts to sample a new subtree if the first one fails.
 
-Add: Could use attemp to be more lenient as we come closer to failing otherwise.
+TODO: Could use attempt to be more lenient as we come closer to failing otherwise.
+
+Note that subtree may be multivariate but node_to_onehot replaces all features with a single one. Will have to map this back to the original features.
 """
-function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}, Float64} where {T}
+function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int}, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}, Float64} where {T}
     
     # Keep track of candidates that pass all checks except similarity
     candidates = Vector{Tuple{AbstractExpressionNode{T}, Float64}}()
@@ -341,23 +349,11 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
         if current_sample_idx >= options.neural_options.sample_batchsize  # Used last sample from batch: Resample.
             x_out_batch = sample_logits(x_in, options.neural_options.sampling_eps, options.neural_options.sample_batchsize)
             current_sample_idx = 1
-        else  # Still have samples left in batch: Use this.
+        else  # Still have samples left in batch: Use these.
             current_sample_idx += 1
         end
         x_out = x_out_batch[current_sample_idx, :, :]
 
-        success, prods = logits_to_prods(x_out, options.neural_options.sample_logits)
-        if !success
-            increment_stats!(STATS_REF[], :decoding_failures, true)
-            continue
-        end
-        
-        success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], feature, T)  # Creates subtree of same type as initial subtree
-        if !success
-            increment_stats!(STATS_REF[], :tree_build_failures, true)
-            continue
-        end 
-        
         if options.neural_options.require_novel_skeleton
             novel = check_novel_skeleton(x_in, x_out, options)
             if !novel
@@ -365,9 +361,27 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
                 continue
             end
         end
+
+        success, prods = logits_to_prods(x_out, options.neural_options.sample_logits)
+        if !success
+            increment_stats!(STATS_REF[], :decoding_failures, true)
+            continue
+        end
+
+        feature_cnt = count(p -> p[2] == "'x1'", prods)
+        if options.neural_options.subtree_max_features == 1  # Univariate decoding
+            success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], fill(first(feature_set), feature_cnt), T)  # Creates subtree of same type as initial subtree
+            is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
+        else  # Multivariate decoding
+            success, new_subtree, is_similar, mse = multivariate_decoding(subtree, prods, feature_cnt, feature_set, options)
+        end
+        if !success
+            increment_stats!(STATS_REF[], :tree_build_failures, true)
+            continue
+        end
         
-        if options.neural_options.require_tree_size_similarity
-            good = compare_sampled_tree(subtree, new_subtree, options)
+        if options.neural_options.require_tree_size_similarity  # FIXME: Could move this into multivariate_decoding so that we don't run whole routine if we know tree size is invalid anyways
+            good = verify_tree_size_similar(subtree, new_subtree, options)
             if !good
                 increment_stats!(STATS_REF[], :tree_comparison_failures, true)
                 continue
@@ -375,11 +389,7 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
         end
 
         if options.neural_options.require_expr_similarity
-            # println("Checking expr similarity")
-            is_similar, mse = check_expr_similarity(subtree, new_subtree, options)
-            # println("is_similar: $is_similar, mse: $mse")
             if is_similar  # This is the best case: We found a similar expression that (if required above) is novel
-                # println("Found similar expression with MSE: $mse")
                 increment_stats!(STATS_REF[], :returned_similar_exprs, true)
                 return true, new_subtree, mse
             else
@@ -402,20 +412,78 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature::Int, option
     return false, subtree, Inf
 end
 
+"""
+Exhaustively try all feature combinations and return the best one.
+"""
+function multivariate_decoding(
+    subtree::AbstractExpressionNode{T}, 
+    prods::Vector{Tuple{String, String}}, 
+    feature_cnt::Int, 
+    feature_set::Set{Int}, 
+    options::AbstractOptions
+)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}, Bool, Float64} where {T}
+    best_mse = Inf
+    best_subtree = nothing
+    best_is_similar = false
+    # @info "Multivariate decoding with $feature_cnt features and $(length(feature_set)) features to choose from -> $(length(feature_set)^feature_cnt) combinations"
+    for features in get_all_feature_combinations(feature_set, feature_cnt)
+        increment_stats!(STATS_REF[], :multivariate_decoding_attempts, true)
+        success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], features, T)
+        if !success  # Tree build failed with this specific feature vector but will also fail with all others (skeleton is the same). Return.
+            # @info "Multivariate prods_to_tree failure: prods=$prods, features=$features"
+            return false, subtree, false, Inf
+        end
+        is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
+        if mse == Inf
+            # @info "Multivariate check_expr_similarity failure"
+            continue
+        end
+        if mse < best_mse
+            best_mse = mse
+            best_subtree = new_subtree
+            best_is_similar = is_similar
+        end
+    end
+    if best_subtree === nothing
+        return false, subtree, false, Inf
+    end
+    return true, best_subtree, best_is_similar, best_mse
+end
+
+function get_all_feature_combinations(feature_set::Set{Int}, feature_cnt::Int)
+    features = collect(feature_set)
+    if feature_cnt == 1
+        return [[f] for f in features]
+    else
+        # Generate all possible combinations of length feature_cnt
+        result = Vector{Int}[]
+        for combo in Base.Iterators.product(fill(features, feature_cnt)...)
+            push!(result, collect(combo))
+        end
+        return result
+    end
+end
+
 function check_expr_similarity(
     subtree::AbstractExpressionNode{T}, 
     new_subtree::AbstractExpressionNode{T}, 
-    options::AbstractOptions
+    options::AbstractOptions,
+    feature_cnt::Int=1
 )::Tuple{Bool, Float32} where {T}
     # FIXME: Make this hyperparams
     # TODO: Check that Float32 is allowed
-    x = Matrix{Float32}(reshape(collect(range(-10.0, 10.0, length=100)), 1, :))
+    if feature_cnt == 1
+        X = Matrix{Float32}(reshape(collect(range(-10.0, 10.0, length=40)), 1, :))
+    elseif feature_cnt > 1
+        points_cnt = 40 * feature_cnt^2  # Is this a good scaling?
+        X = Matrix{Float32}(rand(Uniform(-10.0, 10.0), feature_cnt, points_cnt))
+    end
     
     res = nothing
     res_new = nothing
     
     try
-        (res, complete) = eval_tree_array(subtree, x, options.operators)
+        (res, complete) = eval_tree_array(subtree, X, options.operators)
         good = complete && all((res .< prevfloat(typemax(Float32))) .& (res .> nextfloat(typemin(Float32)))) && !any(isnan, res) && !any(isinf, res)
         if !good
             increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
@@ -428,7 +496,7 @@ function check_expr_similarity(
     
 
     try
-        (res_new, complete_new) = eval_tree_array(new_subtree, x, options.operators)
+        (res_new, complete_new) = eval_tree_array(new_subtree, X, options.operators)
         good_new = complete_new && all((res_new .< prevfloat(typemax(Float32))) .& (res_new .> nextfloat(typemin(Float32)))) && !any(isnan, res_new) && !any(isinf, res_new)
         if !good_new
             increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
@@ -440,7 +508,7 @@ function check_expr_similarity(
     end
 
     # Calculate MSE
-    mse = sum((asinh.(res) - asinh.(res_new)).^2) / length(x)  # FIXME: Make this MSE metric parameter
+    mse = sum((asinh.(res) .- asinh.(res_new)).^2) / size(X)[2]  # Using mean() is more efficient than sum()/n
     return mse < options.neural_options.similarity_threshold, mse
 end
 
@@ -470,7 +538,7 @@ end
 Function for all comparisons between old and new subtree. FIXME: Could also do this on logits level 
     (though with sampling this might not be correct).
 """
-function compare_sampled_tree(
+function verify_tree_size_similar(
     subtree::AbstractExpressionNode{T}, 
     new_subtree::AbstractExpressionNode{T}, 
     options::AbstractOptions
