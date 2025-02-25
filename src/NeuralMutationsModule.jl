@@ -62,7 +62,9 @@ mutable struct NeuralMutationStats
     sampled_mse::Vector{Float32}
 
     # Multivariate decoding stats
-    multivariate_decoding_attempts::Int
+    multivardec_attempts::Int
+    multivardec_totree_failures::Int
+    multivardec_similarity_failures::Int
 
     function NeuralMutationStats(
         total_attempts=0,  # Overall methods calls
@@ -425,26 +427,23 @@ function multivariate_decoding(
     best_mse = Inf
     best_subtree = nothing
     best_is_similar = false
-    # @info "Multivariate decoding with $feature_cnt features and $(length(feature_set)) features to choose from -> $(length(feature_set)^feature_cnt) combinations"
     for features in get_all_feature_combinations(feature_set, feature_cnt)
         increment_stats!(STATS_REF[], :multivariate_decoding_attempts, true)
         success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], features, T)
         if !success  # Tree build failed with this specific feature vector but will also fail with all others (skeleton is the same). Return.
-            # @info "Multivariate prods_to_tree failure: prods=$prods, features=$features"
+            increment_stats!(STATS_REF[], :multivardec_totree_failures, true)
             return false, subtree, false, Inf
         end
         is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
         if mse == Inf
-            # @info "Multivariate check_expr_similarity failure"
             continue
         end
         if mse < best_mse
-            best_mse = mse
-            best_subtree = new_subtree
-            best_is_similar = is_similar
+            best_mse, best_subtree, best_is_similar = mse, new_subtree, is_similar
         end
     end
     if best_subtree === nothing
+        increment_stats!(STATS_REF[], :multivardec_similarity_failures, true)
         return false, subtree, false, Inf
     end
     return true, best_subtree, best_is_similar, best_mse
