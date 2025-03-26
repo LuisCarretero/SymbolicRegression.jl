@@ -225,7 +225,7 @@ function next_generation(
             )
 
             if logger_initialized()
-                log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, mutation_result.member.loss, beforeScore, mutation_result.member.score, true, true)
+                log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, mutation_result.member.loss, beforeScore, mutation_result.member.score, true, true, "pass")
             end
             return mutation_result.member::P, true, num_evals
         else
@@ -245,6 +245,10 @@ function next_generation(
             tmp_recorder["reason"] = "failed_constraint_check"
         end
         mutation_accepted = false
+
+        if logger_initialized()
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, beforeLoss, beforeScore, beforeScore, successful_mutation, mutation_accepted, "failed_constraint_check")
+        end
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
@@ -274,6 +278,10 @@ function next_generation(
             tmp_recorder["reason"] = "nan_loss"
         end
         mutation_accepted = false
+
+        if logger_initialized()
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "nan_loss")
+        end
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
@@ -319,9 +327,8 @@ function next_generation(
         mutation_accepted = false
 
         if logger_initialized()
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted)
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "annealing_or_frequency")
         end
-
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
@@ -343,9 +350,8 @@ function next_generation(
         mutation_accepted = true
 
         if logger_initialized()
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted)
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "pass")
         end
-
         return (
             PopMember(
                 tree,
