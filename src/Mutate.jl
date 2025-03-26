@@ -37,6 +37,7 @@ using ..MutationFunctionsModule:
 using ..NeuralMutationsModule: neural_mutate_tree
 using ..ConstantOptimizationModule: optimize_constants
 using ..RecorderModule: @recorder
+using ..LoggerModule: log_event!, logger_initialized
 
 abstract type AbstractMutationResult{N<:AbstractExpression,P<:PopMember} end
 
@@ -222,6 +223,10 @@ function next_generation(
                 mutation_result.member isa P,
                 "Mutation result must return a `PopMember` if `return_immediately` is true"
             )
+
+            if logger_initialized()
+                log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, mutation_result.member.loss, beforeScore, mutation_result.member.score, true, true)
+            end
             return mutation_result.member::P, true, num_evals
         else
             @assert(
@@ -312,6 +317,11 @@ function next_generation(
             tmp_recorder["reason"] = "annealing_or_frequency"
         end
         mutation_accepted = false
+
+        if logger_initialized()
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted)
+        end
+
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
@@ -331,6 +341,11 @@ function next_generation(
             tmp_recorder["reason"] = "pass"
         end
         mutation_accepted = true
+
+        if logger_initialized()
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted)
+        end
+
         return (
             PopMember(
                 tree,

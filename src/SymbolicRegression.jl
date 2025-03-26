@@ -214,6 +214,7 @@ using DispatchDoctor: @stable
     include("HallOfFame.jl")
     include("Parsing.jl")
     include("NeuralMutationsModule.jl")
+    include("LoggerModule.jl")
     include("Mutate.jl")
     include("RegularizedEvolution.jl")
     include("SingleIteration.jl")
@@ -323,12 +324,12 @@ using .SearchUtilsModule:
     get_cur_maxsize,
     update_hall_of_fame!,
     logging_callback!
+
 using .LoggingModule: AbstractSRLogger, SRLogger, get_logger
 using .TemplateExpressionModule: TemplateExpression, TemplateStructure
 using .TemplateExpressionModule: TemplateExpression, TemplateStructure, ValidVector
 using .ComposableExpressionModule: ComposableExpression
 using .ExpressionBuilderModule: embed_metadata, strip_metadata
-using .NeuralMutationsModule: neural_mutate_tree
 
 @stable default_mode = "disable" begin
     include("deprecates.jl")
