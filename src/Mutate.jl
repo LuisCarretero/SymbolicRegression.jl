@@ -37,7 +37,8 @@ using ..MutationFunctionsModule:
 using ..NeuralMutationsModule: neural_mutate_tree
 using ..ConstantOptimizationModule: optimize_constants
 using ..RecorderModule: @recorder
-using ..LoggerModule: log_event!, logger_initialized
+using ..NeuralLoggingModule: log_event!, logger_initialized
+using ..TreeMetricsModule: tree_edit_distance
 
 abstract type AbstractMutationResult{N<:AbstractExpression,P<:PopMember} end
 
@@ -225,7 +226,8 @@ function next_generation(
             )
 
             if logger_initialized()
-                log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, mutation_result.member.loss, beforeScore, mutation_result.member.score, true, true, "pass")
+                TED = tree_edit_distance(member.tree.tree, mutation_result.member.tree.tree, options)
+                log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, mutation_result.member.loss, beforeScore, mutation_result.member.score, true, true, "pass", TED)
             end
             return mutation_result.member::P, true, num_evals
         else
@@ -247,7 +249,8 @@ function next_generation(
         mutation_accepted = false
 
         if logger_initialized()
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, beforeLoss, beforeScore, beforeScore, successful_mutation, mutation_accepted, "failed_constraint_check")
+            TED = tree_edit_distance(member.tree.tree, tree.tree, options)
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, beforeLoss, beforeScore, beforeScore, successful_mutation, mutation_accepted, "failed_constraint_check", TED)
         end
         return (
             PopMember(
@@ -280,7 +283,8 @@ function next_generation(
         mutation_accepted = false
 
         if logger_initialized()
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "nan_loss")
+            TED = tree_edit_distance(member.tree.tree, tree.tree, options)
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "nan_loss", TED)
         end
         return (
             PopMember(
@@ -327,7 +331,8 @@ function next_generation(
         mutation_accepted = false
 
         if logger_initialized()
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "annealing_or_frequency")
+            TED = tree_edit_distance(member.tree.tree, tree.tree, options)
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "annealing_or_frequency", TED)
         end
         return (
             PopMember(
@@ -350,7 +355,8 @@ function next_generation(
         mutation_accepted = true
 
         if logger_initialized()
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "pass")
+            TED = tree_edit_distance(member.tree.tree, tree.tree, options)
+            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "pass", TED)
         end
         return (
             PopMember(

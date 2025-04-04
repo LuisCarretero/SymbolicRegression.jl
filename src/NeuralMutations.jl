@@ -91,7 +91,9 @@ mutable struct NeuralMutationStats
         sampled_mse=Float32[],
         orig_subtree_string=String[],
         new_subtree_string=String[],
-        multivariate_decoding_attempts=0
+        multivardec_attempts=0,
+        multivardec_totree_failures=0,
+        multivardec_similarity_failures=0
     )
         new(
             total_attempts,
@@ -117,7 +119,9 @@ mutable struct NeuralMutationStats
             sampled_mse,
             orig_subtree_string,
             new_subtree_string,
-            multivariate_decoding_attempts
+            multivardec_attempts,
+            multivardec_totree_failures,
+            multivardec_similarity_failures
         )
     end
 end
@@ -428,7 +432,7 @@ function multivariate_decoding(
     best_subtree = nothing
     best_is_similar = false
     for features in get_all_feature_combinations(feature_set, feature_cnt)
-        increment_stats!(STATS_REF[], :multivariate_decoding_attempts, true)
+        increment_stats!(STATS_REF[], :multivardec_attempts, true)
         success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], features, T)
         if !success  # Tree build failed with this specific feature vector but will also fail with all others (skeleton is the same). Return.
             increment_stats!(STATS_REF[], :multivardec_totree_failures, true)
