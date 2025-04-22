@@ -376,7 +376,8 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
 
         feature_cnt = count(p -> p[2] == "'x1'", prods)
         if options.neural_options.subtree_max_features == 1  # Univariate decoding
-            success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], fill(first(feature_set), feature_cnt), T)  # Creates subtree of same type as initial subtree
+            feature_idx = length(feature_set) > 0 ? first(feature_set) : 1  # FIXME: Check if 
+            success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], fill(feature_idx, feature_cnt), T)  # Creates subtree of same type as initial subtree
             is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
         else  # Multivariate decoding
             success, new_subtree, is_similar, mse = multivariate_decoding(subtree, prods, feature_cnt, feature_set, options)
