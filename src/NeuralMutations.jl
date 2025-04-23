@@ -8,13 +8,13 @@ using ..CoreModule: AbstractOptions, DATA_TYPE
 using ..ParsingModule: nn_config, node_to_onehot, logits_to_prods, prods_to_tree, select_viable_subtree, count_nodes, OPERATOR_ARITY
 
 # Add CUDA imports at module level
-const CUDA_AVAILABLE = Ref{Bool}(false)
+const CUDA_IMPORTED = Ref{Bool}(false)
 try
     using CUDA
     using cuDNN
-    global CUDA_AVAILABLE[] = true
+    global CUDA_IMPORTED[] = true
 catch
-    global CUDA_AVAILABLE[] = false
+    global CUDA_IMPORTED[] = false
 end
 
 export neural_mutate_tree
@@ -225,7 +225,7 @@ end
 
 function load_model(options::AbstractOptions)
     if options.neural_options.device == "cuda"
-        if CUDA_AVAILABLE[]
+        if CUDA_IMPORTED[] && CUDA.functional()
             @info "CUDA available. Loading model on GPU."    
         else 
             @warn "CUDA package not available. Falling back to CPU."
