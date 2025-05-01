@@ -215,7 +215,7 @@ using DispatchDoctor: @stable
     include("HallOfFame.jl")
     include("Parsing.jl")
     include("NeuralMutations.jl")
-    include("NeuralLogging.jl")
+    include("MutationLogging.jl")
     include("Mutate.jl")
     include("RegularizedEvolution.jl")
     include("SingleIteration.jl")

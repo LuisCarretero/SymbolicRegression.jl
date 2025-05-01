@@ -37,7 +37,7 @@ using ..MutationFunctionsModule:
 using ..NeuralMutationsModule: neural_mutate_tree
 using ..ConstantOptimizationModule: optimize_constants
 using ..RecorderModule: @recorder
-using ..NeuralLoggingModule: log_event!, logger_initialized
+using ..MutationLoggingModule: log_event!, logger_initialized
 using ..TreeMetricsModule: tree_edit_distance
 
 abstract type AbstractMutationResult{N<:AbstractExpression,P<:PopMember} end
