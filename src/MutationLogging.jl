@@ -11,7 +11,20 @@ mutable struct Logger
     prefix::String
     fpath::String
     buffer::Vector{NamedTuple{
-        (:timestamp, :mutation_type, :num_evals, :attempts, :loss_before, :loss_after, :score_before, :score_after, :successful_mutation, :mutation_accepted, :result_reason, :TED), 
+        (
+            :timestamp, 
+            :mutation_type, 
+            :num_evals, 
+            :attempts, 
+            :loss_before, 
+            :loss_after, 
+            :score_before, 
+            :score_after, 
+            :successful_mutation, 
+            :mutation_accepted, 
+            :result_reason, 
+            :TED
+        ), 
         Tuple{Float64, String, DTYPE, Int, DTYPE, DTYPE, DTYPE, DTYPE, Bool, Bool, String, DTYPE}
     }}
     buffer_size::Int
@@ -25,18 +38,33 @@ mutable struct Logger
         # Create filepath with timestamp
         timestamp = Dates.format(now(), "yyyy-mm-dd_HH-MM-SS")
         fpath = joinpath(dirpath, "$(prefix)_$(timestamp).csv")
-
+        
         # Initialize empty buffer
         buffer = Vector{NamedTuple{
-            (:timestamp, :mutation_type, :num_evals, :attempts, :loss_before, :loss_after, :score_before, :score_after, :successful_mutation, :mutation_accepted, :result_reason, :TED), 
+            (
+                :timestamp, 
+                :mutation_type, 
+                :num_evals, 
+                :attempts, 
+                :loss_before, 
+                :loss_after, 
+                :score_before, 
+                :score_after, 
+                :successful_mutation, 
+                :mutation_accepted, 
+                :result_reason, 
+                :TED
+            ), 
             Tuple{Float64, String, DTYPE, Int, DTYPE, DTYPE, DTYPE, DTYPE, Bool, Bool, String, DTYPE}
         }}(undef, buffer_size)
         
         logger = new(dirpath, prefix, fpath, buffer, buffer_size, 0, ReentrantLock())
         
-        # Write headers
+        # Write headers atomically
         open(fpath, "w") do io
-            println(io, "timestamp,mutation_type,num_evals,attempts,loss_before,loss_after,score_before,score_after,successful_mutation,mutation_accepted,result_reason,TED")
+            println(io, 
+                "timestamp,mutation_type,num_evals,attempts,loss_before,loss_after,score_before,score_after," *
+                "successful_mutation,mutation_accepted,result_reason,TED")
         end
         
         return logger
@@ -47,7 +75,7 @@ end
 const GLOBAL_LOGGER = Ref{Union{Nothing, Logger}}(nothing)
 
 # Initialize global logger
-function init_logger(dirpath::String, prefix::String; buffer_size::Int=10_000)
+function init_logger(dirpath::String, prefix::String="mutations"; buffer_size::Int=10_000)
     if !logger_initialized()
         GLOBAL_LOGGER[] = Logger(dirpath, prefix; buffer_size=buffer_size)
     else
@@ -55,12 +83,11 @@ function init_logger(dirpath::String, prefix::String; buffer_size::Int=10_000)
     end
 end
 
-# Get the global logger
 function get_logger()
-    if GLOBAL_LOGGER[] === nothing
+    if !logger_initialized()
         error("Logger not initialized. Call init_logger first!")
     end
-    GLOBAL_LOGGER[]
+    return GLOBAL_LOGGER[]
 end
 
 function logger_initialized()
@@ -105,9 +132,10 @@ function log_event!(
             open(logger.fpath, "a") do io
                 for i in 1:logger.buffer_size
                     e = logger.buffer[i]
-                    println(io, "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts),
-                    $(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after),
-                    $(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
+                    println(io, 
+                        "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts)," *
+                        "$(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after)," *
+                        "$(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
                 end
             end
             logger.buffer_count = 1
@@ -121,9 +149,10 @@ function log_event!(
             open(logger.fpath, "a") do io
                 for i in 1:logger.buffer_count
                     e = logger.buffer[i]
-                    println(io, "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts),
-                    $(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after),
-                    $(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
+                    println(io, 
+                        "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts)," *
+                        "$(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after)," *
+                        "$(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
                 end
             end
             logger.buffer_count = 0
@@ -201,9 +230,10 @@ function close_global_logger!()
                     # Only iterate up to buffer_count, not exceeding buffer size
                     for i in 1:logger.buffer_count
                         e = logger.buffer[i]
-                        println(io, "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts),
-                        $(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after),
-                        $(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
+                        println(io, 
+                            "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts)," *
+                            "$(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after)," *
+                            "$(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
                     end
                 end
                 # Reset buffer count after writing
