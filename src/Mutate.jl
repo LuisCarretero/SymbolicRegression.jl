@@ -238,7 +238,7 @@ end
 
             if logger_initialized()
                 TED = tree_edit_distance(member.tree.tree, mutation_result.member.tree.tree, options)
-                log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, mutation_result.member.loss, beforeScore, mutation_result.member.score, true, true, "pass", TED)
+                log_event!(string(mutation_choice), num_evals, attempts, before_loss, mutation_result.member.loss, before_cost, mutation_result.member.cost, true, true, "pass", TED)
             end
             return mutation_result.member::P, true, num_evals
         else
@@ -263,7 +263,7 @@ end
 
         if logger_initialized()
             TED = tree_edit_distance(member.tree.tree, tree.tree, options)
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, beforeLoss, beforeScore, beforeScore, successful_mutation, mutation_accepted, "failed_constraint_check", TED)
+            log_event!(string(mutation_choice), num_evals, attempts, before_loss, before_loss, before_cost, before_cost, successful_mutation, mutation_accepted, "failed_constraint_check", TED)
         end
         return (
             PopMember(
@@ -292,7 +292,7 @@ end
 
         if logger_initialized()
             TED = tree_edit_distance(member.tree.tree, tree.tree, options)
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "nan_loss", TED)
+            log_event!(string(mutation_choice), num_evals, attempts, before_loss, after_loss, before_cost, after_cost, successful_mutation, mutation_accepted, "nan_loss", TED)
         end
         return (
             PopMember(
@@ -341,7 +341,7 @@ end
 
         if logger_initialized()
             TED = tree_edit_distance(member.tree.tree, tree.tree, options)
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "annealing_or_frequency", TED)
+            log_event!(string(mutation_choice), num_evals, attempts, before_loss, after_loss, before_cost, after_cost, successful_mutation, mutation_accepted, "annealing_or_frequency", TED)
         end
         return (
             PopMember(
@@ -365,7 +365,7 @@ end
 
         if logger_initialized()
             TED = tree_edit_distance(member.tree.tree, tree.tree, options)
-            log_event!(string(mutation_choice), num_evals, attempts, beforeLoss, afterLoss, beforeScore, afterScore, successful_mutation, mutation_accepted, "pass", TED)
+            log_event!(string(mutation_choice), num_evals, attempts, before_loss, after_loss, before_cost, after_cost, successful_mutation, mutation_accepted, "pass", TED)
         end
         return (
             PopMember(

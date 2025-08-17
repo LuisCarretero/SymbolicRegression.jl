@@ -18,8 +18,8 @@ mutable struct Logger
             :attempts, 
             :loss_before, 
             :loss_after, 
-            :score_before, 
-            :score_after, 
+            :cost_before, 
+            :cost_after, 
             :successful_mutation, 
             :mutation_accepted, 
             :result_reason, 
@@ -48,8 +48,8 @@ mutable struct Logger
                 :attempts, 
                 :loss_before, 
                 :loss_after, 
-                :score_before, 
-                :score_after, 
+                :cost_before, 
+                :cost_after, 
                 :successful_mutation, 
                 :mutation_accepted, 
                 :result_reason, 
@@ -63,7 +63,7 @@ mutable struct Logger
         # Write headers atomically
         open(fpath, "w") do io
             println(io, 
-                "timestamp,mutation_type,num_evals,attempts,loss_before,loss_after,score_before,score_after," *
+                "timestamp,mutation_type,num_evals,attempts,loss_before,loss_after,cost_before,cost_after," *
                 "successful_mutation,mutation_accepted,result_reason,TED")
         end
         
@@ -102,8 +102,8 @@ function log_event!(
     attempts::Int, 
     loss_before::DTYPE, 
     loss_after::DTYPE, 
-    score_before::DTYPE, 
-    score_after::DTYPE, 
+    cost_before::DTYPE, 
+    cost_after::DTYPE, 
     successful_mutation::Bool, 
     mutation_accepted::Bool, 
     result_reason::String, 
@@ -116,8 +116,8 @@ function log_event!(
         attempts=attempts, 
         loss_before=loss_before, 
         loss_after=loss_after, 
-        score_before=score_before, 
-        score_after=score_after, 
+        cost_before=cost_before, 
+        cost_after=cost_after, 
         successful_mutation=successful_mutation, 
         mutation_accepted=mutation_accepted, 
         result_reason=result_reason, TED=TED
@@ -134,7 +134,7 @@ function log_event!(
                     e = logger.buffer[i]
                     println(io, 
                         "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts)," *
-                        "$(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after)," *
+                        "$(e.loss_before),$(e.loss_after),$(e.cost_before),$(e.cost_after)," *
                         "$(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
                 end
             end
@@ -151,7 +151,7 @@ function log_event!(
                     e = logger.buffer[i]
                     println(io, 
                         "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts)," *
-                        "$(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after)," *
+                        "$(e.loss_before),$(e.loss_after),$(e.cost_before),$(e.cost_after)," *
                         "$(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
                 end
             end
@@ -166,8 +166,8 @@ function log_event!(
     attempts::Int, 
     loss_before::DTYPE, 
     loss_after::DTYPE, 
-    score_before::DTYPE, 
-    score_after::DTYPE, 
+    cost_before::DTYPE, 
+    cost_after::DTYPE, 
     successful_mutation::Bool, 
     mutation_accepted::Bool, 
     result_reason::String, 
@@ -181,8 +181,8 @@ function log_event!(
         attempts, 
         loss_before, 
         loss_after, 
-        score_before, 
-        score_after, 
+        cost_before, 
+        cost_after, 
         successful_mutation, 
         mutation_accepted, 
         result_reason, 
@@ -196,8 +196,8 @@ function log_event!(  # FIXME: Is this casting function really needed?
     attempts::Number, 
     loss_before::Number, 
     loss_after::Number, 
-    score_before::Number, 
-    score_after::Number, 
+    cost_before::Number, 
+    cost_after::Number, 
     successful_mutation::Bool, 
     mutation_accepted::Bool, 
     result_reason::String, 
@@ -211,8 +211,8 @@ function log_event!(  # FIXME: Is this casting function really needed?
         Int(attempts), 
         DTYPE(loss_before), 
         DTYPE(loss_after), 
-        DTYPE(score_before), 
-        DTYPE(score_after), 
+        DTYPE(cost_before), 
+        DTYPE(cost_after), 
         successful_mutation, 
         mutation_accepted, 
         result_reason, 
@@ -232,7 +232,7 @@ function close_global_logger!()
                         e = logger.buffer[i]
                         println(io, 
                             "$(e.timestamp),$(e.mutation_type),$(e.num_evals),$(e.attempts)," *
-                            "$(e.loss_before),$(e.loss_after),$(e.score_before),$(e.score_after)," *
+                            "$(e.loss_before),$(e.loss_after),$(e.cost_before),$(e.cost_after)," *
                             "$(e.successful_mutation),$(e.mutation_accepted),$(e.result_reason),$(e.TED)")
                     end
                 end
