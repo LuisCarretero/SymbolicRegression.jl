@@ -1,7 +1,9 @@
 module TemplateExpressionModule
 
 using Random: AbstractRNG
+using StatsBase: StatsBase
 using Compat: Fix
+using Random: default_rng
 using DynamicDiff: DynamicDiff
 using DispatchDoctor: @unstable, @stable
 using StyledStrings: @styled_str, annotatedstring
@@ -11,22 +13,35 @@ using DynamicExpressions:
     AbstractExpressionNode,
     AbstractExpression,
     AbstractOperatorEnum,
+    Node,
     OperatorEnum,
     Metadata,
+    EvalOptions,
     get_contents,
-    with_contents,
     get_metadata,
     get_operators,
     get_variable_names,
     get_tree,
+    with_metadata,
+    with_contents,
     node_type,
     count_nodes,
     preserve_sharing
 using DynamicExpressions.InterfacesModule:
     ExpressionInterface, Interfaces, @implements, all_ei_methods_except, Arguments
+using DynamicExpressions.ExpressionModule: _copy
 
+using ..UtilsModule: FixKws
 using ..CoreModule:
-    AbstractOptions, Options, Dataset, CoreModule as CM, AbstractMutationWeights, has_units
+    AbstractOptions,
+    Options,
+    Dataset,
+    CoreModule as CM,
+    AbstractMutationWeights,
+    has_units,
+    DATA_TYPE,
+    AbstractExpressionSpec,
+    ExpressionSpecModule as ES
 using ..ConstantOptimizationModule: ConstantOptimizationModule as CO
 using ..InterfaceDynamicExpressionsModule: InterfaceDynamicExpressionsModule as IDE
 using ..MutationFunctionsModule: MutationFunctionsModule as MF
@@ -40,6 +55,29 @@ using ..MutateModule: MutateModule as MM
 using ..PopMemberModule: PopMember
 using ..ComposableExpressionModule: ComposableExpression, ValidVector
 
+struct ParamVector{T} <: AbstractVector{T}
+    _data::Vector{T}
+end
+Base.size(pv::ParamVector) = size(pv._data)
+Base.getindex(pv::ParamVector, i::Integer) = pv._data[i]
+
+# TODO: This likely slows down evaluation a bit. In the future
+#       we might want to have integers passed explicitly.
+Base.getindex(pv::ParamVector, i::Number) = pv[Int(i)]
+
+function Base.setindex!(::ParamVector, _, _)
+    return error(
+        "ParamVector should be treated as read-only. Create a new ParamVector instead."
+    )
+end
+function Base.getindex(pv::ParamVector, I::ValidVector)
+    data = pv[I.x]
+    return ValidVector(data, I.valid)
+end
+function Base.copy(pv::ParamVector)
+    return ParamVector(copy(pv._data))
+end
+
 """
     TemplateStructure{K,E,NF} <: Function
 
@@ -49,6 +87,8 @@ including functions that define the result in different contexts.
 The `K` parameter is used to specify the symbols representing the inner expressions.
 If not declared using the constructor `TemplateStructure{K}(...)`, the keys of the
 `variable_constraints` `NamedTuple` will be used to infer this.
+
+The `Kp` parameter is used to specify the symbols representing the parameters, if any.
 
 # Fields
 - `combine`: Required function taking a `NamedTuple` of `ComposableExpression`s (sharing the keys `K`),
@@ -60,22 +100,64 @@ If not declared using the constructor `TemplateStructure{K}(...)`, the keys of t
     features used by each expression. If not provided, it will be inferred using the `combine`
     function. For example, if `f` takes two arguments, and `g` takes one, then
     `num_features = (; f=2, g=1)`.
+- `num_parameters`: Optional `NamedTuple` of parameter keys => integers representing the number of
+    parameters required for each parameter vector.
 """
-struct TemplateStructure{K,E<:Function,NF<:NamedTuple{K}} <: Function
+struct TemplateStructure{K,Kp,E<:Function,NF<:NamedTuple{K},NP<:NamedTuple{Kp}} <: Function
     combine::E
     num_features::NF
+    num_parameters::NP
 end
 
-function TemplateStructure{K}(combine::E, num_features=nothing) where {K,E<:Function}
-    num_features = @something(num_features, infer_variable_constraints(Val(K), combine))
-    return TemplateStructure{K,E,typeof(num_features)}(combine, num_features)
+function TemplateStructure{K}(
+    combine::E,
+    _deprecated_num_features=nothing;
+    num_features=nothing,
+    num_parameters=nothing,
+) where {K,E<:Function}
+    return TemplateStructure{K,()}(
+        combine, _deprecated_num_features; num_features, num_parameters
+    )
+end
+function TemplateStructure{K,Kp}(
+    combine::E,
+    _deprecated_num_features=nothing;
+    num_features::Union{NamedTuple{K},Nothing}=nothing,
+    num_parameters::Union{NamedTuple{Kp},Nothing}=nothing,
+) where {K,Kp,E<:Function}
+    if _deprecated_num_features !== nothing
+        Base.depwarn(
+            "Passing `num_features` as an argument is deprecated, pass it explicitly as a keyword argument instead",
+            :TemplateStructure,
+        )
+    end
+    if !isempty(Kp)
+        @assert(
+            num_parameters !== nothing,
+            "Expected `num_parameters` to be provided to indicate the number of parameters for each symbol in `$Kp`"
+        )
+    end
+    num_parameters = @something(num_parameters, NamedTuple(),)
+    num_features = @something(
+        num_features,
+        _deprecated_num_features,
+        infer_variable_constraints(Val(K), num_parameters, combine)
+    )
+    return TemplateStructure{K,Kp,E,typeof(num_features),typeof(num_parameters)}(
+        combine, num_features, num_parameters
+    )
 end
 
 @unstable function combine(template::TemplateStructure, args...)
     return template.combine(args...)
 end
 
+# COV_EXCL_START
 get_function_keys(::TemplateStructure{K}) where {K} = K
+get_parameter_keys(::TemplateStructure{<:Any,Kp}) where {Kp} = Kp
+
+has_params(s::TemplateStructure) = !isempty(get_parameter_keys(s))
+# COV_EXCL_STOP
 
 function _record_composable_expression!(variable_constraints, ::Val{k}, args...) where {k}
     vc = variable_constraints[k][]
@@ -96,21 +178,60 @@ end
 # we just want to record the number of arguments.
 DynamicDiff.D(f::ArgumentRecorder, ::Integer) = f
 
+function check_combiner_applicability(
+    @nospecialize(combiner),
+    @nospecialize(dummy_expressions),
+    @nospecialize(dummy_params),
+    @nospecialize(dummy_valid_vectors),
+)
+    if isempty(dummy_params)
+        if !applicable(combiner, dummy_expressions, dummy_valid_vectors)
+            throw(
+                ArgumentError(
+                    "Your template structure's `combine` function must accept\n" *
+                    "\t1. A `NamedTuple` of `ComposableExpression`s (or `ArgumentRecorder`s)\n" *
+                    "\t2. A tuple of `ValidVector`s",
+                ),
+            )
+        end
+    else
+        if !applicable(combiner, dummy_expressions, dummy_params, dummy_valid_vectors)
+            throw(
+                ArgumentError(
+                    "Your template structure's `combine` function must accept\n" *
+                    "\t1. A `NamedTuple` of `ComposableExpression`s (or `ArgumentRecorder`s)\n" *
+                    "\t2. A `NamedTuple` of `ParamVector`s\n" *
+                    "\t3. A tuple of `ValidVector`s",
+                ),
+            )
+        end
+    end
+    return nothing
+end
+
 """Infers number of features used by each subexpression, by passing in test data."""
-function infer_variable_constraints(::Val{K}, combiner::F) where {K,F}
+function infer_variable_constraints(
+    ::Val{K}, @nospecialize(num_parameters::NamedTuple), @nospecialize(combiner)
+) where {K}
     variable_constraints = NamedTuple{K}(map(_ -> Ref(-1), K))
-    # Now, we need to evaluate the `combine` function to see how many
-    # features are used for each function call. If unset, we record it.
-    # If set, we validate.
     inner = Fix{1}(_record_composable_expression!, variable_constraints)
-    _recorders_of_composable_expressions = NamedTuple{K}(
-        map(k -> ArgumentRecorder(Fix{1}(inner, Val(k))), K)
+    dummy_expressions = NamedTuple{K}(map(k -> ArgumentRecorder(Fix{1}(inner, Val(k))), K))
+    dummy_valid_vectors = Base.Iterators.repeated(ValidVector(ones(Float64, 1), true))
+    dummy_params = NamedTuple{keys(num_parameters)}(
+        map(n -> ParamVector(ones(Float64, n)), values(num_parameters))
     )
-    # We use an evaluation to get the variable constraints
-    combiner(
-        _recorders_of_composable_expressions,
-        Base.Iterators.repeated(ValidVector(ones(Float64, 1), true)),
+
+    check_combiner_applicability(
+        combiner, dummy_expressions, dummy_params, dummy_valid_vectors
     )
+
+    # Actually call the combiner
+    if isempty(dummy_params)
+        combiner(dummy_expressions, dummy_valid_vectors)
+    else
+        combiner(dummy_expressions, dummy_params, dummy_valid_vectors)
+    end
+
     inferred = NamedTuple{K}(map(x -> x[], values(variable_constraints)))
     if any(==(-1), values(inferred))
         failed_keys = filter(k -> inferred[k] == -1, K)
@@ -120,7 +241,7 @@ function infer_variable_constraints(::Val{K}, combiner::F) where {K,F}
 end
 
 """
-    TemplateExpression{T,F,N,E,TS,D} <: AbstractStructuredExpression{T,F,N,E,D}
+    TemplateExpression{T,F,N,E,TS,D} <: AbstractExpression{T,N}
 
 A symbolic expression that allows the combination of multiple sub-expressions
 in a structured way, with constraints on variable usage.
@@ -164,9 +285,9 @@ st_expr = TemplateExpression(
 )
 ```
 
-When fitting a model in SymbolicRegression.jl, you would provide the `TemplateExpression`
-as the `expression_type` argument, and then pass `expression_options=(; structure=TemplateStructure(...))`
-as additional options. The `variable_constraints` will constraint `f` to only have access to `x1` and `x2`,
+When fitting a model in SymbolicRegression.jl, you can provide
+`expression_spec=TemplateExpressionSpec(; structure=TemplateStructure(...))`
+as an option. The `variable_constraints` will constraint `f` to only have access to `x1` and `x2`,
 and `g` to only have access to `x3`.
 """
 struct TemplateExpression{
@@ -176,9 +297,9 @@ struct TemplateExpression{
     E<:ComposableExpression{T,N},
     TS<:NamedTuple{<:Any,<:NTuple{<:Any,E}},
     D<:@NamedTuple{
-        structure::F, operators::O, variable_names::V
-    } where {O<:AbstractOperatorEnum,V},
-} <: AbstractStructuredExpression{T,F,N,E,D}
+        structure::F, operators::O, variable_names::V, parameters::P
+    } where {O<:AbstractOperatorEnum,V,P<:NamedTuple{<:Any,<:NTuple{<:Any,ParamVector}}},
+} <: AbstractExpression{T,N}
     trees::TS
     metadata::Metadata{D}
 
@@ -187,9 +308,12 @@ struct TemplateExpression{
     ) where {
         TS,
         F<:TemplateStructure,
-        D<:@NamedTuple{structure::F, operators::O, variable_names::V} where {O,V},
+        D<:@NamedTuple{
+            structure::F, operators::O, variable_names::V, parameters::P
+        } where {O,V,P<:NamedTuple{<:Any,<:NTuple{<:Any,ParamVector}}},
     }
         @assert keys(trees) == get_function_keys(metadata.structure)
+        @assert keys(metadata.parameters) == keys(metadata.structure.num_parameters)
         E = typeof(first(values(trees)))
         N = node_type(E)
         return new{eltype(N),F,N,E,TS,D}(trees, metadata)
@@ -197,26 +321,154 @@ struct TemplateExpression{
 end
 
 function TemplateExpression(
-    trees::NamedTuple{<:Any,<:NTuple{<:Any,<:AbstractExpression}};
-    structure::F,
+    trees::NamedTuple{<:Any,<:NTuple{<:Any,<:AbstractExpression{T}}};
+    structure::TemplateStructure,
     operators::Union{AbstractOperatorEnum,Nothing}=nothing,
     variable_names::Union{AbstractVector{<:AbstractString},Nothing}=nothing,
-) where {F<:TemplateStructure}
+    parameters::Union{NamedTuple,Nothing}=nothing,
+) where {T}
     example_tree = first(values(trees))::AbstractExpression
     operators = get_operators(example_tree, operators)
     variable_names = get_variable_names(example_tree, variable_names)
-    metadata = (; structure, operators, variable_names)
+    final_parameters = if has_params(structure)
+        resolved_parameters = @something parameters begin
+            # Auto-initialize parameters to zeros when not provided
+            NamedTuple{keys(structure.num_parameters)}(
+                map(Base.Fix1(zeros, T), values(structure.num_parameters))
+            )
+        end
+        for k in keys(structure.num_parameters)
+            @assert(
+                length(resolved_parameters[k]) == structure.num_parameters[k],
+                "Expected `parameters.$k` to have length $(structure.num_parameters[k]), got $(length(resolved_parameters[k]))"
+            )
+        end
+        # TODO: Delete this extra check once we are confident that it works
+        NamedTuple{keys(structure.num_parameters)}(
+            map(p -> p isa ParamVector ? p : ParamVector(p::Vector), resolved_parameters),
+        )
+    else
+        @assert(
+            parameters === nothing || isempty(parameters),
+            "Expected `parameters` to not be specified for `structure.num_parameters=$(structure.num_parameters)`"
+        )
+        NamedTuple()
+    end
+    metadata = (; structure, operators, variable_names, parameters=final_parameters)
     return TemplateExpression(trees, Metadata(metadata))
 end
 
-@unstable DE.constructorof(::Type{<:TemplateExpression}) = TemplateExpression
+@unstable DE.constructorof(::Type{<:TemplateExpression}) = TemplateExpression  # COV_EXCL_LINE
 
 @implements(
     ExpressionInterface{all_ei_methods_except(())}, TemplateExpression, [Arguments()]
 )
 
+has_params(ex::TemplateExpression) = has_params(get_metadata(ex).structure)
+
 @unstable function combine(ex::TemplateExpression, args...)
     return combine(get_metadata(ex).structure, args...)
+end
+
+function Base.copy(e::TemplateExpression)
+    ts = get_contents(e)
+    meta = get_metadata(e)
+    meta_inner = DE.ExpressionModule.unpack_metadata(meta)
+    copy_ts = NamedTuple{keys(ts)}(map(copy, values(ts)))
+    keys_except_structure = filter(!=(:structure), keys(meta_inner))
+    copy_metadata = (;
+        meta_inner.structure,
+        # Note: this `_copy` is just `copy` but with handling for `nothing` and `NamedTuple`
+        NamedTuple{keys_except_structure}(
+            map(_copy, values(meta_inner[keys_except_structure]))
+        )...,
+    )
+    return DE.constructorof(typeof(e))(copy_ts, Metadata(copy_metadata))
+end
+function DE.get_contents(e::TemplateExpression)
+    return e.trees
+end
+function DE.get_metadata(e::TemplateExpression)
+    return e.metadata
+end
+function DE.get_operators(
+    e::TemplateExpression, operators::Union{AbstractOperatorEnum,Nothing}=nothing
+)
+    return @something(operators, get_metadata(e).operators)
+end
+function DE.get_variable_names(
+    e::TemplateExpression,
+    variable_names::Union{AbstractVector{<:AbstractString},Nothing}=nothing,
+)
+    return if variable_names !== nothing
+        variable_names
+    elseif hasproperty(get_metadata(e), :variable_names)
+        get_metadata(e).variable_names
+    else
+        nothing
+    end
+end
+function DE.get_scalar_constants(e::TemplateExpression)
+    # Get constants for each inner expression
+    consts_and_refs = map(DE.get_scalar_constants, values(get_contents(e)))
+    parameters = get_metadata(e).parameters
+    flat_constants = vcat(
+        map(first, consts_and_refs)..., (has_params(e) ? values(parameters) : ())...
+    )
+    # Collect info so we can put them back in the right place,
+    # like the indexes of the constants in the flattened array
+    refs = map(c_ref -> (; n=length(first(c_ref)), ref=last(c_ref)), consts_and_refs)
+    return flat_constants, refs
+end
+function DE.set_scalar_constants!(e::TemplateExpression, constants, refs)
+    cursor = Ref(1)
+    foreach(values(get_contents(e)), refs) do tree, r
+        n = r.n
+        i = cursor[]
+        c = constants[i:(i + n - 1)]
+        DE.set_scalar_constants!(tree, c, r.ref)
+        cursor[] = i + n
+    end
+    if has_params(e)
+        num_parameters = get_metadata(e).structure.num_parameters
+        parameters = get_metadata(e).parameters
+        for k in keys(num_parameters)
+            n = num_parameters[k]
+            i = cursor[]
+            parameters[k]._data[:] = constants[i:(i + n - 1)]
+            cursor[] = i + n
+        end
+    end
+    return e
+end
+
+Base.@kwdef struct PreallocatedTemplateExpression{A,B}
+    trees::A
+    parameters::B
+end
+
+function DE.allocate_container(e::TemplateExpression, n::Union{Nothing,Integer}=nothing)
+    ts = get_contents(e)
+    parameters = get_metadata(e).parameters
+    preallocated_trees = NamedTuple{keys(ts)}(
+        map(t -> DE.allocate_container(t, n), values(ts))
+    )
+    preallocated_parameters = NamedTuple{keys(parameters)}(
+        map(p -> similar(p), values(parameters))
+    )
+    return PreallocatedTemplateExpression(preallocated_trees, preallocated_parameters)
+end
+function DE.copy_into!(dest::PreallocatedTemplateExpression, src::TemplateExpression)
+    ts = get_contents(src)
+    parameters = get_metadata(src).parameters
+    new_contents = NamedTuple{keys(ts)}(map(DE.copy_into!, values(dest.trees), values(ts)))
+    for k in keys(parameters)
+        dest.parameters[k][:] = (parameters[k]::ParamVector)[:]
+    end
+    new_parameters = NamedTuple{keys(parameters)}(
+        map(p -> ParamVector(p), values(dest.parameters))
+    )
+    return with_metadata(with_contents(src, new_contents); parameters=new_parameters)
 end
 
 function DE.get_tree(ex::TemplateExpression{<:Any,<:Any,<:Any,E}) where {E}
@@ -232,6 +484,13 @@ function DE.get_tree(ex::TemplateExpression{<:Any,<:Any,<:Any,E}) where {E}
         with_contents(inner_ex, variable_tree) for
         (inner_ex, variable_tree) in zip(values(raw_contents), variable_trees)
     ]
+    if has_params(ex)
+        throw(
+            ArgumentError(
+                "`get_tree` is not implemented for TemplateExpression with parameters"
+            ),
+        )
+    end
 
     return DE.get_tree(
         combine(get_metadata(ex).structure, raw_contents, variable_expressions)
@@ -251,8 +510,9 @@ function EB.create_expression(
     # NOTE: We need to copy over the operators so we can call the structure function
     operators = options.operators
     variable_names = embed ? dataset.variable_names : nothing
+    eval_options = EvalOptions(; turbo=options.turbo, bumper=options.bumper)
     inner_expressions = ntuple(
-        _ -> ComposableExpression(copy(t); operators, variable_names),
+        _ -> ComposableExpression(copy(t); operators, variable_names, eval_options),
         Val(length(function_keys)),
     )
     # TODO: Generalize to other inner expression types
@@ -268,11 +528,25 @@ function EB.extra_init_params(
     dataset::Dataset{T},
     ::Val{embed},
 ) where {T,embed,E<:TemplateExpression}
+    num_parameters = options.expression_options.structure.num_parameters
+    parameters = if isempty(num_parameters)
+        NamedTuple()
+    else
+        # COV_EXCL_START
+        if prototype === nothing
+            NamedTuple{keys(num_parameters)}(
+                map(n -> ParamVector(randn(T, (n,))), values(num_parameters))
+            )
+        else
+            _copy(get_metadata(prototype).parameters::NamedTuple)
+        end
+        # COV_EXCL_STOP
+    end
     # We also need to include the operators here to be consistent with `create_expression`.
-    return (; options.operators, options.expression_options...)
+    return (; options.operators, options.expression_options..., parameters)
 end
 function EB.sort_params(params::NamedTuple, ::Type{<:TemplateExpression})
-    return (; params.structure, params.operators, params.variable_names)
+    return (; params.structure, params.operators, params.variable_names, params.parameters)
 end
 
 function ComplexityModule.compute_complexity(
@@ -289,50 +563,69 @@ end
 # Rather than using iterator with repeat, just make a tuple:
 function _colors(::Val{n}) where {n}
     return ntuple(
-        (i -> (:magenta, :green, :red, :blue, :yellow, :cyan)[mod1(i, n)]), Val(n)
+        (i -> (:magenta, :green, :red, :blue, :yellow, :cyan)[mod1(i, 6)]), Val(n)
     )
 end
-
 _color_string(s::AbstractString, c::Symbol) = styled"{$c:$s}"
+
+function _format_component(ex::AbstractExpression, c::Symbol; operators, kws...)
+    return _color_string(DE.string_tree(ex, operators; kws...), c)
+end
+function _format_component(param::ParamVector, c::Symbol; pretty, f_constant::FC) where {FC}
+    p_str = if !pretty || length(param) <= 5
+        join(map(f_constant, param), ", ")
+    else
+        string(join(map(f_constant, param[1:3]), ", "), ", ..., ", f_constant(param[end]))
+    end
+
+    return _color_string('[' * p_str * ']', c)
+end
+function _prefix_string_with_pipe(k::Symbol, s; all_keys, pretty)
+    prefix = if !pretty || length(all_keys) == 1
+        ""
+    elseif k == first(all_keys)
+        "╭ "
+    elseif k == last(all_keys)
+        "╰ "
+    else
+        "├ "
+    end
+    return annotatedstring(prefix, string(k), " = ", s)
+end
 function DE.string_tree(
-    tree::TemplateExpression,
+    ex::TemplateExpression,
     operators::Union{AbstractOperatorEnum,Nothing}=nothing;
     pretty::Bool=false,
-    variable_names=nothing,
+    variable_names=nothing,  # ignored
+    f_constant::FC=string,
     kws...,
-)
-    raw_contents = get_contents(tree)
-    function_keys = keys(raw_contents)
-    num_features = get_metadata(tree).structure.num_features
+) where {FC}
+    expressions = get_contents(ex)
+    num_features = get_metadata(ex).structure.num_features
     total_num_features = max(values(num_features)...)
-    colors = _colors(Val(length(function_keys)))
-    variable_names = ["#" * string(i) for i in 1:total_num_features]
-    inner_strings = NamedTuple{function_keys}(
+    variable_names = ['#' * string(i) for i in 1:total_num_features]
+    parameters = has_params(ex) ? get_metadata(ex).parameters : NamedTuple()
+    all_keys = (keys(num_features)..., keys(parameters)...)
+    colors = _colors(Val(length(all_keys)))
+
+    strings = NamedTuple{all_keys}((
         map(
-            ex -> DE.string_tree(ex, operators; pretty, variable_names, kws...),
-            values(raw_contents),
-        ),
-    )
-    strings = NamedTuple{function_keys}(
+            FixKws(
+                _format_component; operators, pretty, variable_names, f_constant, kws...
+            ),
+            values(expressions),
+            colors[1:length(expressions)],
+        )...,
         map(
-            (k, s, c) -> let
-                prefix = if !pretty || length(function_keys) == 1
-                    ""
-                elseif k == first(function_keys)
-                    "╭ "
-                elseif k == last(function_keys)
-                    "╰ "
-                else
-                    "├ "
-                end
-                annotatedstring(prefix * string(k) * " = ", _color_string(s, c))
-            end,
-            function_keys,
-            values(inner_strings),
-            colors,
-        ),
+            FixKws(_format_component; pretty, f_constant),
+            values(parameters),
+            colors[(length(expressions) + 1):end],
+        )...,
+    ))
+    prefixed_strings = NamedTuple{all_keys}(
+        map(FixKws(_prefix_string_with_pipe; all_keys, pretty), all_keys, values(strings))
     )
-    return annotatedstring(join(strings, pretty ? styled"\n" : "; "))
+    return annotatedstring(join(prefixed_strings, pretty ? styled"\n" : styled"; "))
 end
 function HOF.make_prefix(::TemplateExpression, ::AbstractOptions, ::Dataset)
     return ""
@@ -349,11 +642,20 @@ end
             kws...,
         )
             raw_contents = get_contents(tree)
+            metadata = get_metadata(tree)
             if has_invalid_variables(tree)
                 return (nothing, false)
             end
+            extra_args = if has_params(tree)
+                (metadata.parameters,)
+            else
+                ()
+            end
             result = combine(
-                tree, raw_contents, map(x -> ValidVector(copy(x), true), eachrow(cX))
+                tree,
+                raw_contents,
+                extra_args...,
+                map(x -> ValidVector(copy(x), true), eachrow(cX)),
             )
             return result.x, result.valid
         end
@@ -370,8 +672,13 @@ end
     end
 )
 @unstable begin
+    # COV_EXCL_START
     IDE.expected_array_type(::AbstractArray, ::Type{<:TemplateExpression}) = Any
     IDE.expected_array_type(::Matrix{T}, ::Type{<:TemplateExpression}) where {T} = Any
+    IDE.expected_array_type(
+        ::SubArray{T,2,Matrix{T}}, ::Type{<:TemplateExpression}
+    ) where {T} = Any
+    # COV_EXCL_STOP
 end
 
 function DA.violates_dimensional_constraints(
@@ -387,6 +694,7 @@ function MM.condition_mutation_weights!(
     @nospecialize(member::P),
     @nospecialize(options::AbstractOptions),
     curmaxsize::Int,
+    nfeatures::Int,
 ) where {T,L,N<:TemplateExpression,P<:PopMember{T,L,N}}
     if !preserve_sharing(typeof(member.tree))
         weights.form_connection = 0.0
@@ -394,6 +702,11 @@ function MM.condition_mutation_weights!(
     end
 
     MM.condition_mutate_constant!(typeof(member.tree), weights, member, options, curmaxsize)
+
+    # Disable feature mutation if only one feature available
+    if nfeatures <= 1
+        weights.mutate_feature = 0.0
+    end
 
     complexity = ComplexityModule.compute_complexity(member, options)
 
@@ -417,6 +730,8 @@ function CM.operator_specialization(
 ) where {O<:OperatorEnum}
     return O
 end
+
+CM.OptionsModule.recommend_loss_function_expression(::Type{<:TemplateExpression}) = true
 
 function CM.max_features(
     dataset::Dataset, options::Options{<:Any,<:Any,<:Any,<:TemplateExpression}
@@ -455,6 +770,23 @@ function MF.with_contents_for_mutation(
     return with_contents(ex, new_contents)
 end
 
+"""We only want to mutate to a valid number of features."""
+function MF.get_nfeatures_for_mutation(ex::TemplateExpression, ctx::Symbol, _::Int)
+    return get_metadata(ex).structure.num_features[ctx]
+end
+
+function MM.condition_mutate_constant!(
+    ::Type{<:TemplateExpression},
+    weights::AbstractMutationWeights,
+    member::PopMember,
+    options::AbstractOptions,
+    curmaxsize::Int,
+)
+    # Avoid modifying the mutate_constant weight, since
+    # otherwise we would be mutating constants all the time!
+    return nothing
+end
+
 """We combine the operators of each inner expression."""
 function DE.combine_operators(
     ex::TemplateExpression{T,N}, operators::Union{AbstractOperatorEnum,Nothing}=nothing
@@ -478,12 +810,58 @@ function DE.simplify_tree!(
     )
     return with_contents(ex, new_contents)
 end
-
-function DE.count_scalar_constants(ex::TemplateExpression)
-    return sum(DE.count_scalar_constants, values(get_contents(ex)))
+function has_constants(tree::AbstractExpression)
+    any(get_tree(tree)) do node
+        node.degree == 0 && node.constant
+    end
 end
-function CO.count_constants_for_optimization(ex::TemplateExpression)
-    return sum(CO.count_constants_for_optimization, values(get_contents(ex)))
+has_constants(ex::TemplateExpression) = any(has_constants, values(get_contents(ex)))
+function MF.mutate_constant(
+    ex::TemplateExpression{T},
+    temperature,
+    options::AbstractOptions,
+    rng::AbstractRNG=default_rng(),
+) where {T<:DATA_TYPE}
+    regular_constant_mutation = !has_params(ex) || (has_constants(ex) && rand(rng, Bool))
+    if regular_constant_mutation
+        # Normal mutation of inner constant
+        tree, context = MF.get_contents_for_mutation(ex, rng)
+        new_tree = MF.mutate_constant(tree, temperature, options, rng)
+        return MF.with_contents_for_mutation(ex, new_tree, context)
+    else # Mutate parameters
+
+        # We mutate between 1 and all of the parameter vector
+        key_to_mutate = rand(rng, keys(get_metadata(ex).parameters))
+        num_params = get_metadata(ex).structure.num_parameters[key_to_mutate]::Integer
+        num_params_to_mutate = rand(rng, 1:num_params)
+        # TODO: I feel we should mutate all keys at once, and only randomize which
+        # parameters (of the combined list) to mutate.
+
+        idx_to_mutate = StatsBase.sample(
+            rng, 1:num_params, num_params_to_mutate; replace=false
+        )
+        parameters = get_metadata(ex).parameters[key_to_mutate]::ParamVector
+        factors = [MF.mutate_factor(T, temperature, options, rng) for _ in idx_to_mutate]
+        @inbounds for (i, f) in zip(idx_to_mutate, factors)
+            parameters._data[i] *= f
+        end
+        return ex
+    end
+end
+# TODO: Look at other ParametricExpression behavior
+
+for f in (:(DE.count_scalar_constants), :(CO.count_constants_for_optimization))
+    @eval function $f(ex::TemplateExpression)
+        return (
+            sum($f, values(get_contents(ex))) +
+            (has_params(ex) ? sum($f, values(get_metadata(ex).parameters)) : 0)
+        )
+    end
+    @eval function $f(p::ParamVector)
+        # TODO: This is not general enough; we should be using `get_scalar_constants`
+        # on the parameters themselves.
+        return length(p._data)
+    end
 end
 
 function CC.check_constraints(
@@ -534,5 +912,131 @@ function Base.isempty(ex::TemplateExpression)
 end
 
 # TODO: Add custom behavior to adjust what feature nodes can be generated
+
+"""
+    TemplateExpressionSpec <: AbstractExpressionSpec
+
+(Experimental) Specification for template expressions with pre-defined structure.
+"""
+Base.@kwdef struct TemplateExpressionSpec{ST<:TemplateStructure} <: AbstractExpressionSpec
+    structure::ST
+end
+
+# COV_EXCL_START
+ES.get_expression_type(::TemplateExpressionSpec) = TemplateExpression
+ES.get_expression_options(spec::TemplateExpressionSpec) = (; structure=spec.structure)
+ES.get_node_type(::TemplateExpressionSpec) = Node
+# COV_EXCL_STOP
+
+IDE.require_copy_to_workers(::Type{<:TemplateExpression}) = true  # COV_EXCL_LINE
+function IDE.make_example_inputs(
+    ::Type{<:TemplateExpression}, ::Type{T}, options, dataset
+) where {T}
+    ex = EB.create_expression(CM.init_value(T), options, dataset)
+    raw_contents = get_contents(ex)
+    extra_args = has_params(ex) ? (get_metadata(ex).parameters,) : ()
+    return (;
+        ops=(get_metadata(ex).structure.combine,),
+        example_inputs=(
+            raw_contents,
+            extra_args...,
+            map(x -> ValidVector(copy(x), true), eachrow(dataset.X)),
+        ),
+    )
+end
+
+"""
+    parse_expression(ex::NamedTuple; kws...)
+
+Extension of `parse_expression` to handle NamedTuple input for creating template expressions.
+Each key in the NamedTuple should map to a string expression using #N placeholder syntax.
+
+# Example
+```julia
+# With expression_spec (recommended for template expressions):
+spec = TemplateExpressionSpec(; structure=TemplateStructure{(:f, :g)}(...))
+parse_expression((; f="cos(#1) - 1.5", g="exp(#2) - #1"); expression_spec=spec, operators=operators, variable_names=["x1", "x2"])
+
+# Or with explicit parameters:
+parse_expression((; f="cos(#1) - 1.5", g="exp(#2) - #1"); expression_type=TemplateExpression, operators=operators, variable_names=["x1", "x2"])
+```
+"""
+@unstable function DE.parse_expression(
+    ex::NamedTuple;
+    expression_spec::Union{ES.AbstractExpressionSpec,Nothing}=nothing,
+    expression_options::Union{NamedTuple,Nothing}=nothing,
+    eval_options::Union{EvalOptions,Nothing}=nothing,
+    operators::Union{AbstractOperatorEnum,Nothing}=nothing,
+    binary_operators::Union{Vector{<:Function},Nothing}=nothing,
+    unary_operators::Union{Vector{<:Function},Nothing}=nothing,
+    variable_names::Union{AbstractVector,Nothing}=nothing,
+    expression_type::Union{Type,Nothing}=nothing,
+    node_type::Union{Type,Nothing}=nothing,
+    kws...,
+)
+    if expression_spec !== nothing
+        actual_expression_type = ES.get_expression_type(expression_spec)
+        actual_expression_options = ES.get_expression_options(expression_spec)
+        actual_node_type = ES.get_node_type(expression_spec)
+    else
+        actual_expression_type = something(expression_type, TemplateExpression)
+        actual_expression_options = expression_options
+        actual_node_type = something(node_type, Node)
+    end
+
+    # COV_EXCL_START
+    @assert actual_expression_type <: TemplateExpression
+    @assert(
+        actual_expression_options !== nothing &&
+            actual_expression_options.structure isa TemplateStructure,
+        "NamedTuple expressions require expression_options with a TemplateStructure"
+    )
+    # COV_EXCL_STOP
+
+    eval_options_kws = if eval_options !== nothing
+        (; eval_options)
+    else
+        NamedTuple()
+    end
+
+    inner_expressions = NamedTuple{keys(ex)}(
+        map(values(ex)) do expr_str
+            max_var_index = 0
+            for m in eachmatch(r"#(\d+)", expr_str)
+                capture = m.captures[1]
+                if capture !== nothing
+                    var_idx = parse(Int, capture)
+                    max_var_index = max(max_var_index, var_idx)
+                end
+            end
+
+            placeholder_variable_names = ["__arg_$i" for i in 1:max_var_index]
+            expr_str = replace(expr_str, r"#(\d+)" => s"__arg_\1")
+
+            parsed_expr = DE.parse_expression(
+                expr_str;
+                operators,
+                binary_operators,
+                unary_operators,
+                variable_names=placeholder_variable_names,
+                expression_type=DE.Expression,
+                node_type=actual_node_type,
+                kws...,
+            )
+
+            ComposableExpression(
+                parsed_expr.tree; operators, variable_names=nothing, eval_options_kws...
+            )
+        end,
+    )
+
+    return actual_expression_type(
+        inner_expressions;
+        structure=actual_expression_options.structure,
+        operators,
+        variable_names=nothing,
+        kws...,
+    )
+end
 
 end

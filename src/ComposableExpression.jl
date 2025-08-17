@@ -1,12 +1,14 @@
 module ComposableExpressionModule
 
 using DispatchDoctor: @unstable
+using Compat: Fix
 using DynamicExpressions:
     AbstractExpression,
     Expression,
     AbstractExpressionNode,
     AbstractOperatorEnum,
     Metadata,
+    EvalOptions,
     constructorof,
     get_metadata,
     eval_tree_array,
@@ -50,16 +52,21 @@ f(f, f) # == (x1 * sin(x2)) * sin((x1 * sin(x2)))
 struct ComposableExpression{
     T,
     N<:AbstractExpressionNode{T},
-    D<:@NamedTuple{operators::O, variable_names::V} where {O<:AbstractOperatorEnum,V},
+    D<:@NamedTuple{
+        operators::O, variable_names::V, eval_options::E
+    } where {O<:AbstractOperatorEnum,V,E<:Union{Nothing,EvalOptions}},
 } <: AbstractComposableExpression{T,N}
     tree::N
     metadata::Metadata{D}
 end
 
 @inline function ComposableExpression(
-    tree::AbstractExpressionNode{T}; metadata...
+    tree::AbstractExpressionNode{T};
+    operators::Union{AbstractOperatorEnum,Nothing}=nothing,
+    variable_names::Union{AbstractVector{<:AbstractString},Nothing}=nothing,
+    eval_options::Union{Nothing,EvalOptions}=nothing,
 ) where {T}
-    d = (; metadata...)
+    d = (; operators, variable_names, eval_options)
     return ComposableExpression(tree, Metadata(d))
 end
 
@@ -112,12 +119,18 @@ end
 function CO.count_constants_for_optimization(ex::AbstractComposableExpression)
     return CO.count_constants_for_optimization(convert(Expression, ex))
 end
+
+struct PreallocatedComposableExpression{N}
+    tree::N
+end
 function DE.allocate_container(
     prototype::ComposableExpression, n::Union{Nothing,Integer}=nothing
 )
-    return (; tree=DE.allocate_container(get_contents(prototype), n))
+    return PreallocatedComposableExpression(
+        DE.allocate_container(get_contents(prototype), n)
+    )
 end
-function DE.copy_into!(dest::NamedTuple, src::ComposableExpression)
+function DE.copy_into!(dest::PreallocatedComposableExpression, src::ComposableExpression)
     new_tree = DE.copy_into!(dest.tree, get_contents(src))
     return DE.with_contents(src, new_tree)
 end
@@ -151,6 +164,9 @@ struct ValidVector{A<:AbstractVector}
 end
 ValidVector(x::Tuple{Vararg{Any,2}}) = ValidVector(x...)
 
+function get_eval_options(ex::AbstractComposableExpression)
+    return @something(get_metadata(ex).eval_options, EvalOptions())
+end
 function (ex::AbstractComposableExpression)(x)
     return error("ComposableExpression does not support input of type $(typeof(x))")
 end
@@ -180,14 +196,22 @@ function (ex::AbstractComposableExpression)(
         return ValidVector(_get_value(first(xs)), false)
     else
         X = Matrix(stack(map(_get_value, xs))')
-        return ValidVector(eval_tree_array(ex, X))
+        eval_options = get_eval_options(ex)
+        return ValidVector(eval_tree_array(ex, X; eval_options))
     end
 end
 function (ex::AbstractComposableExpression{T})() where {T}
     X = Matrix{T}(undef, 0, 1)  # Value is irrelevant as it won't be used
-    out, _ = eval_tree_array(ex, X)  # TODO: The valid is not used; not sure how to incorporate
-    return only(out)::T
+    # TODO: We force avoid the eval_options here,
+    #       to get a faster constant evaluation result...
+    #       but not sure if this is a good idea.
+    out, complete = eval_tree_array(ex, X)  # TODO: The valid is not used; not sure how to incorporate
+    y = only(out)
+    return complete ? y::T : nan(y)::T
 end
+nan(::T) where {T<:AbstractFloat} = convert(T, NaN)
+nan(x) = x
+
 function (ex::AbstractComposableExpression)(
     x::AbstractComposableExpression, _xs::Vararg{AbstractComposableExpression,N}
 ) where {N}
@@ -205,6 +229,8 @@ function (ex::AbstractComposableExpression)(
     end
     return with_contents(ex, tree)
 end
+
+# TODO: More methods for passing simple numbers to ComposableExpression (in combination with other inputs as well)
 
 # Basically we want to vectorize every single operation on ValidVector,
 # so that the user can use it easily.
@@ -231,13 +257,17 @@ _get_value(x) = x
 for op in (
     :*, :/, :+, :-, :^, :÷, :mod, :log,
     :atan, :atand, :copysign, :flipsign,
-    :&, :|, :⊻, ://, :\,
+    :&, :|, :⊻, ://, :\, :rem,
+    :(>), :(<), :(>=), :(<=), :max, :min
 )
     @eval begin
         Base.$(op)(x::ValidVector, y::ValidVector) = apply_operator(Base.$(op), x, y)
         Base.$(op)(x::ValidVector, y::Number) = apply_operator(Base.$(op), x, y)
         Base.$(op)(x::Number, y::ValidVector) = apply_operator(Base.$(op), x, y)
     end
+end
+function Base.literal_pow(::typeof(^), x::ValidVector, ::Val{p}) where {p}
+    return apply_operator(Fix{1}(Fix{3}(Base.literal_pow, Val(p)), ^), x)
 end
 
 for op in (
@@ -255,5 +285,7 @@ for op in (
     @eval Base.$(op)(x::ValidVector) = apply_operator(Base.$(op), x)
 end
 #! format: on
+
+# TODO: Support for 3-ary operators
 
 end

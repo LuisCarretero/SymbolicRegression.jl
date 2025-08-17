@@ -11,11 +11,10 @@ using ...UtilsModule: @ignore
 #TODO - actually add these operators to the module!
 
 # TODO: Should this be limited to AbstractFloat instead?
-function gamma(x::T)::T where {T<:DATA_TYPE}
+function gamma(x::T)::T where {T<:Number}
     out = SpecialFunctions.gamma(x)
     return isinf(out) ? T(NaN) : out
 end
-gamma(x) = SpecialFunctions.gamma(x)
 
 atanh_clip(x) = atanh(mod(x + oneunit(x), oneunit(x) + oneunit(x)) - oneunit(x)) * one(x)
 # == atanh((x + 1) % 2 - 1)
@@ -26,7 +25,8 @@ const Dual = ForwardDiff.Dual
 #binary: mod
 #unary: exp, abs, log1p, sin, cos, tan, sinh, cosh, tanh, asin, acos, atan, asinh, acosh, atanh, erf, erfc, gamma, relu, round, floor, ceil, round, sign.
 
-const FloatOrDual = Union{AbstractFloat,Dual{<:Any,<:AbstractFloat}}
+const FloatOrDual = Union{AbstractFloat,Dual}
+# Note that a complex dual is Complex{<:Dual}, so we are safe to use this signature.
 
 # Use some fast operators from https://github.com/JuliaLang/julia/blob/81597635c4ad1e8c2e1c5753fda4ec0e7397543f/base/fastmath.jl
 # Define allowed operators. Any julia operator can also be used.
@@ -101,6 +101,15 @@ end
 function greater(x, y)
     return (x > y) * one(x)
 end
+function less(x, y)
+    return (x < y) * one(x)
+end
+function greater_equal(x, y)
+    return (x >= y) * one(x)
+end
+function less_equal(x, y)
+    return (x <= y) * one(x)
+end
 function cond(x, y)
     return (x > zero(x)) * y
 end
@@ -114,6 +123,7 @@ function logical_and(x, y)
     return ((x > zero(x)) & (y > zero(y))) * one(x)
 end
 
+# COV_EXCL_START
 # Strings
 DE.get_op_name(::typeof(safe_pow)) = "^"
 DE.get_op_name(::typeof(safe_log)) = "log"
@@ -126,8 +136,19 @@ DE.get_op_name(::typeof(safe_acosh)) = "acosh"
 DE.get_op_name(::typeof(safe_atanh)) = "atanh"
 DE.get_op_name(::typeof(safe_sqrt)) = "sqrt"
 
+# Strings that only get printed for pretty printing,
+# but not when saving to the file
+DE.get_pretty_op_name(::typeof(greater)) = ">"
+DE.get_pretty_op_name(::typeof(less)) = "<"
+DE.get_pretty_op_name(::typeof(greater_equal)) = ">="
+DE.get_pretty_op_name(::typeof(less_equal)) = "<="
+
 # Expression algebra
 DE.declare_operator_alias(::typeof(safe_pow), ::Val{2}) = ^
+DE.declare_operator_alias(::typeof(greater), ::Val{2}) = >
+DE.declare_operator_alias(::typeof(less), ::Val{2}) = <
+DE.declare_operator_alias(::typeof(greater_equal), ::Val{2}) = >=
+DE.declare_operator_alias(::typeof(less_equal), ::Val{2}) = <=
 DE.declare_operator_alias(::typeof(safe_log), ::Val{1}) = log
 DE.declare_operator_alias(::typeof(safe_log2), ::Val{1}) = log2
 DE.declare_operator_alias(::typeof(safe_log10), ::Val{1}) = log10
@@ -158,5 +179,10 @@ get_safe_op(::typeof(acos)) = safe_acos
 get_safe_op(::typeof(sqrt)) = safe_sqrt
 get_safe_op(::typeof(acosh)) = safe_acosh
 get_safe_op(::typeof(atanh)) = safe_atanh
+get_safe_op(::typeof(>)) = greater
+get_safe_op(::typeof(<)) = less
+get_safe_op(::typeof(>=)) = greater_equal
+get_safe_op(::typeof(<=)) = less_equal
+# COV_EXCL_STOP
 
 end

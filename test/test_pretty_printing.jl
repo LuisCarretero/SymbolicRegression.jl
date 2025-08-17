@@ -12,15 +12,15 @@
     y = [2.0, 3.0, 4.0]
     dataset = Dataset(X, y)
     member = PopMember(dataset, ex, options; deterministic=false)
-    member.score = 1.0
-    @test member isa PopMember{Float64,Float64,<:Expression{Float64,Node{Float64}}}
+    member.cost = 1.0
+    @test member isa PopMember{Float64,Float64,<:Expression{Float64,<:Node{Float64}}}
     s_member = shower(member)
-    @test s_member == "PopMember(tree = ((x ^ 2.0) + 1.5), loss = 16.25, score = 1.0)"
+    @test s_member == "PopMember(tree = ((x ^ 2.0) + 1.5), loss = 16.25, cost = 1.0)"
 
     # New options shouldn't change this
     options = Options(; binary_operators=[-, /])
     s_member = shower(member)
-    @test s_member == "PopMember(tree = ((x ^ 2.0) + 1.5), loss = 16.25, score = 1.0)"
+    @test s_member == "PopMember(tree = ((x ^ 2.0) + 1.5), loss = 16.25, cost = 1.0)"
 end
 
 @testitem "pretty print hall of fame" tags = [:part1] begin
@@ -41,8 +41,8 @@ end
     y = [2.0, 3.0, 4.0]
     dataset = Dataset(X, y)
     member = PopMember(dataset, ex, options; deterministic=false)
-    member.score = 1.0
-    @test member isa PopMember{Float64,Float64,<:Expression{Float64,Node{Float64}}}
+    member.cost = 1.0
+    @test member isa PopMember{Float64,Float64,<:Expression{Float64,<:Node{Float64}}}
 
     hof = HallOfFame(options, dataset)
     hof = embed_metadata(hof, options, dataset)
@@ -59,7 +59,7 @@ end
     .exists[4] = false
     .members[4] = undef
     .exists[5] = true
-    .members[5] = PopMember(tree = ((x ^ 2.0) + 1.5), loss = 16.25, score = 1.0)
+    .members[5] = PopMember(tree = ((x ^ 2.0) + 1.5), loss = 16.25, cost = 1.0)
     .exists[6] = false
     .members[6] = undef
     .exists[7] = false
@@ -137,4 +137,27 @@ F_d = (-...
 ) * v
 )
 """
+end
+
+@testitem "pretty print vs serialization for comparison operators" tags = [:part1] begin
+    using SymbolicRegression
+    using SymbolicRegression: greater, greater_equal, string_tree
+
+    options = Options(; binary_operators=[greater, greater_equal])
+    x1 = Expression(Node(; feature=1); operators=options.operators)
+    x2 = Expression(Node(; feature=2); operators=options.operators)
+    ex = x1 > x2
+    ex2 = x1 >= x2
+
+    # Pretty printing should use symbols
+    pretty_str = string_tree(ex; pretty=true)
+    pretty_str2 = string_tree(ex2; pretty=true)
+    @test pretty_str == "x1 > x2"
+    @test pretty_str2 == "x1 >= x2"
+
+    # Serialization should use function names
+    serialized_str = string_tree(ex)
+    serialized_str2 = string_tree(ex2)
+    @test serialized_str == "greater(x1, x2)"
+    @test serialized_str2 == "greater_equal(x1, x2)"
 end

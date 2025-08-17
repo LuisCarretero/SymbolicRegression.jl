@@ -239,26 +239,19 @@ using SymbolicRegression
 options = Options(
     binary_operators=[+, -, *],
     unary_operators=[cos],
-    expression_options=(
-        structure=TemplateStructure(),
-        variable_constraints=Dict(1 => [1, 2], 2 => [2])
-    )
 )
 
-# Create expression nodes with constraints
 operators = options.operators
 variable_names = ["x1", "x2"]
 x1 = Expression(
     Node{Float64}(feature=1),
     operators=operators,
     variable_names=variable_names,
-    structure=options.expression_options.structure
 )
 x2 = Expression(
     Node{Float64}(feature=2),
     operators=operators,
     variable_names=variable_names,
-    structure=options.expression_options.structure
 )
 
 # Construct and evaluate expression
@@ -267,9 +260,8 @@ X = rand(Float64, 2, 100)
 output = expr(X)
 ```
 
-This `Expression` type, contains both the structure
-and the operators used in the expression. These are what
-are returned by the search. The raw `Node` type (which is
+This `Expression` type, contains the operators used in the expression.
+These are what are returned by the search. The raw `Node` type (which is
 what used to be output directly) is accessible with
 
 ```julia
@@ -280,7 +272,7 @@ get_contents(expr)
 
 Template expressions allow you to define structured expressions where different parts can be constrained to use specific variables.
 In this example, we'll create expressions that constrain the functional form in highly specific ways.
-(_For a more complex example, see ["Searching with template expressions"](examples/template_expression.md)_)
+(_For more complex examples, see ["Searching with template expressions"](examples/template_expression.md)_ and ["Parameterized Template Expressions"](examples/template_parametric_expression.md)\_)
 
 First, let's set up our basic configuration:
 
@@ -293,9 +285,9 @@ using MLJBase: machine, fit!, report
 The key part is defining our template structure. This determines how different parts of the expression combine:
 
 ```julia
-structure = TemplateStructure{(:f, :g)}(
-    ((; f, g), (x1, x2, x3)) -> f(x1, x2) + g(x2) - g(x3)
-)
+expression_spec = @template_spec(expressions=(f, g)) do x1, x2, x3
+    f(x1, x2) + g(x2) - g(x3)
+end
 ```
 
 With this structure, we are telling the algorithm that it can learn
@@ -327,8 +319,7 @@ Now, remember our structure: for the model to learn this,
 it would need to correctly disentangle the contribution
 of `f` and `g`!
 
-Now we can set up and train our model.
-Note that we pass the structure in to `expression_options`:
+Now we can set up and train our model by passing the structure in to `expression_spec`:
 
 ```julia
 model = SRRegressor(;
@@ -336,8 +327,7 @@ model = SRRegressor(;
     unary_operators=(cos,),
     niterations=500,
     maxsize=25,
-    expression_type=TemplateExpression,
-    expression_options=(; structure),
+    expression_spec=expression_spec,
 )
 
 mach = machine(model, X, y)
@@ -382,7 +372,7 @@ The above code demonstrates how template expressions can be used to:
 
 You can even output custom structs - see the more detailed [Template Expression example](examples/template_expression.md)!
 
-Be sure to also check out the [Parametric Expression example](examples/parametric_expression.md).
+Be sure to also check out the [Parametric Template Expressions example](examples/template_parametric_expression.md).
 
 ## 9. Logging with TensorBoard
 
@@ -440,11 +430,11 @@ y = @. 1 / (x^2 * sqrt(x^2 - 1))  # Values of the integrand
 Now, define the template for the derivative operator:
 
 ```julia
-using DynamicDiff: D
+using SymbolicRegression: D
 
-structure = TemplateStructure{(:f,)}(
-    ((; f), (x,)) -> D(f, 1)(x)  # Differentiate `f` with respect to its first argument
-)
+expression_spec = @template_spec(expressions=(f,)) do x
+    D(f, 1)(x)
+end
 ```
 
 We can now set up the model to find the symbolic expression for the integral:
@@ -456,8 +446,7 @@ model = SRRegressor(
     binary_operators=(+, -, *, /),
     unary_operators=(sqrt,),
     maxsize=20,
-    expression_type=TemplateExpression,
-    expression_options=(; structure),
+    expression_spec=expression_spec,
 )
 
 X = (; x=x)
@@ -478,7 +467,79 @@ println("Learned expression: ", best_expr)
 
 If successful, the result should simplify to something like $\frac{\sqrt{x^2 - 1}}{x}$, which is the integral of the target function.
 
-## 11. Additional features
+## 11. Seeding search with initial guesses
+
+You can also provide initial guesses for the search.
+In this example, let's look for the following function:
+
+```math
+\sin(x_1 x_2 + 0.1) + \cos(x_3) x_4 + \frac{x_5}{x_6^2 + 1}
+```
+
+```julia
+using SymbolicRegression, MLJ
+
+X = randn(Float32, 6, 2048)
+y = @. sin(X[1, :] * X[2, :] + 0.1f0) + cos(X[3, :]) * X[4, :] + X[5, :] / (X[6, :] * X[6, :] + 1)
+```
+
+This expression is quite complex. Now, say that we know most of
+the structure, but want to further optimize it. We can provide
+a guess for the search:
+
+```julia
+model = SRRegressor(
+    binary_operators=[+, -, *, /],
+    unary_operators=[sin, cos],
+    maxsize=35,
+    niterations=35,
+    guesses=["sin(x1 * x2) + cos(x3) * x4 + x5 / (x6 * x6 + 0.9)", #= can provide additional guesses here =#],
+    batching=true,
+    batch_size=32,
+)
+
+mach = machine(model, X', y)
+fit!(mach)
+```
+
+If everything goes well, it should optimize the `0.9` to `1.0`,
+and also discover the `+ 0.1` term inside the sinusoid, whereas
+this might have been difficult to discover as fast from the normal search.
+
+You can also provide multiple guesses. For a template expression,
+your guesses should be an array of named tuples, such as
+`(; f="cos(#1) + 0.1", g="sin(#2) - 0.9")`.
+
+## 12. Higher-arity operators
+
+You can use operators with more than 2 arguments by passing an `OperatorEnum` explicitly.
+This operator allows you to declare arbitrary arities by passing them in a `arity => (op1, op2, ...)` format.
+
+Here's an example using a ternary conditional operator:
+
+```julia
+using SymbolicRegression, MLJ
+
+scalar_ifelse(a, b, c) = a > 0 ? b : c
+
+X = randn(3, 100)
+y = [X[1, i] > 0 ? 2*X[2, i] : X[3, i] for i in 1:100]
+
+model = SRRegressor(
+    operators=OperatorEnum(
+        1 => (),
+        2 => (+, -, *, /),
+        3 => (scalar_ifelse,)
+    ),
+    niterations=35,
+)
+mach = machine(model, X', y)
+fit!(mach)
+```
+
+This sort of piecewise logic might be difficult to express with only binary operators.
+
+## 13. Additional features
 
 For the many other features available in SymbolicRegression.jl,
 check out the API page for `Options`. You might also find it useful

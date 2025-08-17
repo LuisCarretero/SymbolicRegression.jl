@@ -2,9 +2,14 @@ module OptionsModule
 
 using DispatchDoctor: @unstable
 using Optim: Optim
-using StatsBase: StatsBase
 using DynamicExpressions:
-    OperatorEnum, Expression, default_node_type, AbstractExpression, AbstractExpressionNode
+    OperatorEnum,
+    AbstractOperatorEnum,
+    Expression,
+    default_node_type,
+    AbstractExpression,
+    AbstractExpressionNode
+using DynamicExpressions.NodeModule: has_max_degree, with_max_degree
 using ADTypes: AbstractADType, ADTypes
 using LossFunctions: L2DistLoss, SupervisedLoss
 using Optim: Optim
@@ -18,6 +23,10 @@ using ..OperatorsModule:
     safe_pow,
     mult,
     sub,
+    greater,
+    less,
+    greater_equal,
+    less_equal,
     safe_log,
     safe_log10,
     safe_log2,
@@ -32,70 +41,79 @@ using ..NeuralOptionsModule: NeuralOptions, validate_neural_options
 import ..OptionsStructModule: Options
 using ..OptionsStructModule: ComplexityMapping, operator_specialization
 using ..UtilsModule: @save_kwargs, @ignore
+using ..ExpressionSpecModule:
+    AbstractExpressionSpec,
+    ExpressionSpec,
+    get_expression_type,
+    get_expression_options,
+    get_node_type
 
 """Build constraints on operator-level complexity from a user-passed dict."""
 @unstable function build_constraints(;
-    una_constraints,
-    bin_constraints,
-    @nospecialize(unary_operators),
-    @nospecialize(binary_operators)
-)::Tuple{Vector{Int},Vector{Tuple{Int,Int}}}
+    constraints=nothing,
+    una_constraints=nothing,
+    bin_constraints=nothing,
+    @nospecialize(operators_by_degree::Tuple{Vararg{Any,D}})
+) where {D}
+    constraints = if constraints !== nothing
+        @assert all(isnothing, (una_constraints, bin_constraints))
+        constraints
+    elseif any(!isnothing, (una_constraints, bin_constraints))
+        (una_constraints, bin_constraints)
+    else
+        ntuple(i -> nothing, Val(D))
+    end
+    return _build_constraints(constraints, operators_by_degree)
+end
+@unstable function _build_constraints(
+    constraints, @nospecialize(operators_by_degree::Tuple{Vararg{Any,D}})
+) where {D}
     # Expect format ((*)=>(-1, 3)), etc.
-    # TODO: Need to disable simplification if (*, -, +, /) are constrained?
-    #  Or, just quit simplification is constraints violated.
 
-    is_una_constraints_already_done = una_constraints isa Vector{Int}
-    _una_constraints1 = if una_constraints isa Array && !is_una_constraints_already_done
-        Dict(una_constraints)
-    else
-        una_constraints
-    end
-    _una_constraints2 = if _una_constraints1 === nothing
-        fill(-1, length(unary_operators))
-    elseif !is_una_constraints_already_done
-        [
-            haskey(_una_constraints1, op) ? _una_constraints1[op]::Int : -1 for
-            op in unary_operators
-        ]
-    else
-        _una_constraints1
+    is_constraints_already_done = ntuple(Val(D)) do i
+        i == 1 && constraints[i] isa Vector{Int} ||
+            i > 1 && constraints[i] isa Vector{NTuple{i,Int}}
     end
 
-    is_bin_constraints_already_done = bin_constraints isa Vector{Tuple{Int,Int}}
-    _bin_constraints1 = if bin_constraints isa Array && !is_bin_constraints_already_done
-        Dict(bin_constraints)
-    else
-        bin_constraints
+    _op_constraints = ntuple(Val(D)) do i
+        if constraints[i] isa Array && !is_constraints_already_done[i]
+            Dict(constraints[i])
+        else
+            constraints[i]
+        end
     end
-    _bin_constraints2 = if _bin_constraints1 === nothing
-        fill((-1, -1), length(binary_operators))
-    elseif !is_bin_constraints_already_done
-        [
-            if haskey(_bin_constraints1, op)
-                _bin_constraints1[op]::Tuple{Int,Int}
+
+    return ntuple(Val(D)) do i
+        let default_value = i == 1 ? -1 : ntuple(j -> -1, i)
+            if isnothing(_op_constraints[i])
+                fill(default_value, length(operators_by_degree[i]))
+            elseif !is_constraints_already_done[i]
+                typeof(default_value)[
+                    get(_op_constraints[i], op, default_value) for
+                    op in operators_by_degree[i]
+                ]
             else
-                (-1, -1)
-            end for op in binary_operators
-        ]
-    else
-        _bin_constraints1
+                _op_constraints[i]::Vector{typeof(default_value)}
+            end
+        end
     end
-
-    return _una_constraints2, _bin_constraints2
 end
 
 @unstable function build_nested_constraints(;
-    @nospecialize(binary_operators), @nospecialize(unary_operators), nested_constraints
+    nested_constraints, @nospecialize(operators_by_degree)
 )
     nested_constraints === nothing && return nested_constraints
-    # Check that intersection of binary operators and unary operators is empty:
-    for op in binary_operators
-        if op ∈ unary_operators
+
+    # Check that no operator appears in multiple degrees:
+    all_operators = Set()
+    for ops in operators_by_degree, op in ops
+        if op ∈ all_operators
             error(
-                "Operator $(op) is both a binary and unary operator. " *
+                "Operator $(op) appears in multiple degrees. " *
                 "You can't use nested constraints.",
             )
         end
+        push!(all_operators, op)
     end
 
     # Convert to dict:
@@ -107,31 +125,50 @@ end
             [cons[1] => Dict(cons[2]...) for cons in nested_constraints]...
         )
     end
+
     for (op, nested_constraint) in _nested_constraints
-        if !(op ∈ binary_operators || op ∈ unary_operators)
+        if !(op ∈ all_operators)
             error("Operator $(op) is not in the operator set.")
         end
         for (nested_op, max_nesting) in nested_constraint
-            if !(nested_op ∈ binary_operators || nested_op ∈ unary_operators)
+            if !(nested_op ∈ all_operators)
                 error("Operator $(nested_op) is not in the operator set.")
             end
-            @assert nested_op ∈ binary_operators || nested_op ∈ unary_operators
             @assert max_nesting >= -1 && typeof(max_nesting) <: Int
         end
     end
 
     # Lastly, we clean it up into a dict of (degree,op_idx) => max_nesting.
     return [
-        let (degree, idx) = if op ∈ binary_operators
-                2, findfirst(isequal(op), binary_operators)::Int
-            else
-                1, findfirst(isequal(op), unary_operators)::Int
+        let (degree, idx) = begin
+                found_degree = 0
+                found_idx = 0
+                for (d, ops) in enumerate(operators_by_degree)
+                    idx_in_degree = findfirst(isequal(op), ops)
+                    if idx_in_degree !== nothing
+                        found_degree = d
+                        found_idx = idx_in_degree
+                        break
+                    end
+                end
+                found_degree == 0 && error("Operator $(op) is not in the operator set.")
+                (found_degree, found_idx)
             end,
             new_max_nesting_dict = [
-                let (nested_degree, nested_idx) = if nested_op ∈ binary_operators
-                        2, findfirst(isequal(nested_op), binary_operators)::Int
-                    else
-                        1, findfirst(isequal(nested_op), unary_operators)::Int
+                let (nested_degree, nested_idx) = begin
+                        found_degree = 0
+                        found_idx = 0
+                        for (d, ops) in enumerate(operators_by_degree)
+                            idx_in_degree = findfirst(isequal(nested_op), ops)
+                            if idx_in_degree !== nothing
+                                found_degree = d
+                                found_idx = idx_in_degree
+                                break
+                            end
+                        end
+                        found_degree == 0 &&
+                        error("Operator $(nested_op) is not in the operator set.")
+                        (found_degree, found_idx)
                     end
                     (nested_degree, nested_idx, max_nesting)
                 end for (nested_op, max_nesting) in nested_constraint
@@ -142,73 +179,48 @@ end
     ]
 end
 
-function binopmap(@nospecialize(op))
-    if op == plus
-        return +
-    elseif op == mult
-        return *
-    elseif op == sub
-        return -
-    elseif op == div
-        return /
-    elseif op == ^
-        return safe_pow
-    elseif op == pow
-        return safe_pow
-    end
-    return op
-end
-function inverse_binopmap(@nospecialize(op))
-    if op == safe_pow
-        return ^
-    end
-    return op
-end
+const OP_MAP = Dict{Any,Any}(
+    plus => (+),
+    mult => (*),
+    sub => (-),
+    div => (/),
+    (^) => safe_pow,
+    pow => safe_pow,
+    Base.:(>) => greater,
+    Base.:(<) => less,
+    Base.:(>=) => greater_equal,
+    Base.:(<=) => less_equal,
+    log => safe_log,
+    log10 => safe_log10,
+    log2 => safe_log2,
+    log1p => safe_log1p,
+    sqrt => safe_sqrt,
+    asin => safe_asin,
+    acos => safe_acos,
+    acosh => safe_acosh,
+    atanh => safe_atanh,
+)
+const INVERSE_OP_MAP = Dict{Any,Any}(
+    safe_pow => (^),
+    greater => Base.:(>),
+    less => Base.:(<),
+    greater_equal => Base.:(>=),
+    less_equal => Base.:(<=),
+    safe_log => log,
+    safe_log10 => log10,
+    safe_log2 => log2,
+    safe_log1p => log1p,
+    safe_sqrt => sqrt,
+    safe_asin => asin,
+    safe_acos => acos,
+    safe_acosh => acosh,
+    safe_atanh => atanh,
+)
 
-function unaopmap(@nospecialize(op))
-    if op == log
-        return safe_log
-    elseif op == log10
-        return safe_log10
-    elseif op == log2
-        return safe_log2
-    elseif op == log1p
-        return safe_log1p
-    elseif op == sqrt
-        return safe_sqrt
-    elseif op == asin
-        return safe_asin
-    elseif op == acos
-        return safe_acos
-    elseif op == acosh
-        return safe_acosh
-    elseif op == atanh
-        return safe_atanh
-    end
-    return op
-end
-function inverse_unaopmap(@nospecialize(op))
-    if op == safe_log
-        return log
-    elseif op == safe_log10
-        return log10
-    elseif op == safe_log2
-        return log2
-    elseif op == safe_log1p
-        return log1p
-    elseif op == safe_sqrt
-        return sqrt
-    elseif op == safe_asin
-        return asin
-    elseif op == safe_acos
-        return acos
-    elseif op == safe_acosh
-        return acosh
-    elseif op == safe_atanh
-        return atanh
-    end
-    return op
-end
+opmap(@nospecialize(op)) = get(OP_MAP, op, op)
+inverse_opmap(@nospecialize(op)) = get(INVERSE_OP_MAP, op, op)
+
+recommend_loss_function_expression(expression_type) = false
 
 create_mutation_weights(w::AbstractMutationWeights) = w
 create_mutation_weights(w::NamedTuple) = MutationWeights(; w...)
@@ -216,6 +228,23 @@ create_mutation_weights(w::NamedTuple) = MutationWeights(; w...)
 # Constructors
 create_neural_options(options::NeuralOptions) = options
 create_neural_options(options::NamedTuple) = NeuralOptions(; options...)
+
+@unstable function with_max_degree_from_context(
+    node_type, user_provided_operators, operators
+)
+    if has_max_degree(node_type)
+        # The user passed a node type with an explicit max degree,
+        # so we don't override it.
+        node_type
+    else
+        if user_provided_operators
+            # We select a degree so that we fit the number of operators
+            with_max_degree(node_type, Val(length(operators)))
+        else
+            with_max_degree(node_type, Val(2))
+        end
+    end
+end
 
 const deprecated_options_mapping = Base.ImmutableDict(
     :mutationWeights => :mutation_weights,
@@ -256,6 +285,10 @@ const OPTION_DESCRIPTIONS = """- `defaults`: What set of defaults to use for `Op
     of the same type as input, and outputs the same type. For the SymbolicUtils
     simplification backend, you will need to define a generic method of the
     operator so it takes arbitrary types.
+- `operator_enum_constructor`: Constructor function to use for creating the operators enum.
+    By default, OperatorEnum is used, but you can provide a different constructor like
+    GenericOperatorEnum. The constructor must accept the keyword arguments 'binary_operators'
+    and 'unary_operators'.
 - `unary_operators`: Same, but for
     unary operators (one input scalar, gives an output scalar).
 - `constraints`: Array of pairs specifying size constraints
@@ -318,10 +351,15 @@ const OPTION_DESCRIPTIONS = """- `defaults`: What set of defaults to use for `Op
             return sum((prediction .- dataset.y) .^ 2) / dataset.n
         end
 
-- `expression_type::Type{E}=Expression`: The type of expression to use.
-    For example, `Expression`.
-- `node_type::Type{N}=default_node_type(Expression)`: The type of node to use for the search.
-    For example, `Node` or `GraphNode`. The default is computed by `default_node_type(expression_type)`.
+- `loss_function_expression`: Similar to `loss_function`, but takes `AbstractExpression` instead of `AbstractExpressionNode` as its first argument. Useful for `TemplateExpressionSpec`.
+- `loss_scale`: Determines how loss values are scaled when computing scores. Options are:
+    - `:log` (default): Uses logarithmic scaling of loss ratios. This mode requires non-negative loss values
+        and is ideal for traditional loss functions that are always positive.
+    - `:linear`: Uses direct differences between losses. This mode handles any loss values (including negative)
+        and is useful for custom loss functions, especially those based on likelihoods.
+- `expression_spec::AbstractExpressionSpec`: A specification of what types of expressions to use in the
+    search. For example, `ExpressionSpec()` (default). You can also see `TemplateExpressionSpec` and
+    `ParametricExpressionSpec` for specialized cases.
 - `populations`: How many populations of equations to use.
 - `population_size`: How many equations in each population.
 - `ncycles_per_iteration`: How many generations to consider per iteration.
@@ -377,6 +415,8 @@ const OPTION_DESCRIPTIONS = """- `defaults`: What set of defaults to use for `Op
     migrated equations at the end of each cycle.
 - `fraction_replaced_hof`: What fraction to replace with hall of fame
     equations at the end of each cycle.
+- `fraction_replaced_guesses`: What fraction to replace with user-provided
+    guess expressions at the end of each cycle.
 - `should_simplify`: Whether to simplify equations. If you
     pass a custom objective, this will be set to `false`.
 - `should_optimize_constants`: Whether to use an optimization algorithm
@@ -400,9 +440,9 @@ const OPTION_DESCRIPTIONS = """- `defaults`: What set of defaults to use for `Op
     an instance of `AbstractADType` (see `ADTypes.jl`).
     Default is `nothing`, which means `Optim.jl` will estimate gradients (likely
     with finite differences). You can also pass a symbolic version of the backend
-    type, such as `:Zygote` for Zygote, `:Enzyme`, etc. Most backends will not
-    work, and many will never work due to incompatibilities, though support for some
-    is gradually being added.
+    type, such as `:Zygote` for Zygote.jl or `:Mooncake` for Mooncake.jl. Most backends
+    will not work, and many will never work due to incompatibilities, though
+    support for some is gradually being added.
 - `perturbation_factor`: When mutating a constant, either
     multiply or divide by (1+perturbation_factor)^(rand()+1).
 - `probability_negate_constant`: Probability of negating a constant in the equation
@@ -470,15 +510,10 @@ $(OPTION_DESCRIPTIONS)
     @nospecialize(defaults::Union{VersionNumber,Nothing} = nothing),
     # Search options:
     ## 1. Creating the Search Space:
-    @nospecialize(binary_operators = nothing),
-    @nospecialize(unary_operators = nothing),
+    @nospecialize(operators::Union{Nothing,AbstractOperatorEnum} = nothing),
     @nospecialize(maxsize::Union{Nothing,Integer} = nothing),
     @nospecialize(maxdepth::Union{Nothing,Integer} = nothing),
-    @nospecialize(expression_type::Type{<:AbstractExpression} = Expression),
-    @nospecialize(expression_options::NamedTuple = NamedTuple()),
-    @nospecialize(
-        node_type::Type{<:AbstractExpressionNode} = default_node_type(expression_type)
-    ),
+    @nospecialize(expression_spec::Union{Nothing,AbstractExpressionSpec} = nothing),
     ## 2. Setting the Search Size:
     @nospecialize(populations::Union{Nothing,Integer} = nothing),
     @nospecialize(population_size::Union{Nothing,Integer} = nothing),
@@ -486,6 +521,7 @@ $(OPTION_DESCRIPTIONS)
     ## 3. The Objective:
     @nospecialize(elementwise_loss::Union{Function,SupervisedLoss,Nothing} = nothing),
     @nospecialize(loss_function::Union{Function,Nothing} = nothing),
+    @nospecialize(loss_function_expression::Union{Function,Nothing} = nothing),
     ###           [model_selection - only used in MLJ interface]
     @nospecialize(dimensional_constraint_penalty::Union{Nothing,Real} = nothing),
     ###           dimensionless_constants_only
@@ -504,6 +540,10 @@ $(OPTION_DESCRIPTIONS)
     ###           should_simplify
     ## 5. Mutations:
     @nospecialize(
+        operator_enum_constructor::Union{Nothing,Type{<:AbstractOperatorEnum},Function} =
+            nothing
+    ),
+    @nospecialize(
         mutation_weights::Union{AbstractMutationWeights,AbstractVector,NamedTuple,Nothing} =
             nothing
     ),
@@ -511,7 +551,7 @@ $(OPTION_DESCRIPTIONS)
     @nospecialize(annealing::Union{Bool,Nothing} = nothing),
     @nospecialize(alpha::Union{Nothing,Real} = nothing),
     ###           perturbation_factor
-    @nospecialize(probability_negate_constant::Union{Real,Nothing} = nothing),
+    ###           probability_negate_constant
     ###           skip_mutation_failures
     ## 6. Tournament Selection:
     @nospecialize(tournament_selection_n::Union{Nothing,Integer} = nothing),
@@ -563,6 +603,7 @@ $(OPTION_DESCRIPTIONS)
     ## 2. Setting the Search Size:
     ## 3. The Objective:
     dimensionless_constants_only::Bool=false,
+    loss_scale::Symbol=:log,
     ## 4. Working with Complexities:
     complexity_mapping::Union{Function,ComplexityMapping,Nothing}=nothing,
     use_frequency::Bool=true,
@@ -570,6 +611,7 @@ $(OPTION_DESCRIPTIONS)
     should_simplify::Union{Nothing,Bool}=nothing,
     ## 5. Mutations:
     perturbation_factor::Union{Nothing,Real}=nothing,
+    probability_negate_constant::Union{Real,Nothing}=nothing,
     skip_mutation_failures::Bool=true,
     ## 6. Tournament Selection
     ## 7. Constant Optimization:
@@ -587,6 +629,7 @@ $(OPTION_DESCRIPTIONS)
     hof_migration::Bool=true,
     fraction_replaced::Union{Real,Nothing}=nothing,
     fraction_replaced_hof::Union{Real,Nothing}=nothing,
+    fraction_replaced_guesses::Union{Real,Nothing}=nothing,
     topn::Union{Nothing,Integer}=nothing,
     ## 9. Data Preprocessing:
     ## 10. Stopping Criteria:
@@ -618,12 +661,17 @@ $(OPTION_DESCRIPTIONS)
     define_helper_functions::Bool=true,
     #########################################
     # Deprecated args: ######################
+    expression_type::Union{Nothing,Type{<:AbstractExpression}}=nothing,
+    expression_options::Union{Nothing,NamedTuple}=nothing,
+    node_type::Union{Nothing,Type{<:AbstractExpressionNode}}=nothing,
     output_file::Union{Nothing,AbstractString}=nothing,
     fast_cycle::Bool=false,
     npopulations::Union{Nothing,Integer}=nothing,
     npop::Union{Nothing,Integer}=nothing,
     deprecated_return_state::Union{Bool,Nothing}=nothing,
     neural_options::NeuralOptions=NeuralOptions(),
+    unary_operators=nothing,
+    binary_operators=nothing,
     kws...,
     #########################################
 )
@@ -707,26 +755,39 @@ $(OPTION_DESCRIPTIONS)
     if output_file !== nothing
         error("`output_file` is deprecated. Use `output_directory` instead.")
     end
+    user_provided_operators = !isnothing(operators)
 
-    if elementwise_loss === nothing
-        elementwise_loss = L2DistLoss()
-    else
-        if loss_function !== nothing
-            error("You cannot specify both `elementwise_loss` and `loss_function`.")
-        end
+    if user_provided_operators
+        @assert binary_operators === nothing
+        @assert unary_operators === nothing
+        @assert operator_enum_constructor === nothing
     end
+
+    @assert(
+        count(!isnothing, [elementwise_loss, loss_function, loss_function_expression]) <= 1,
+        "You cannot specify more than one of `elementwise_loss`, `loss_function`, and `loss_function_expression`."
+    )
+
+    if !isnothing(loss_function) && recommend_loss_function_expression(expression_type)
+        @warn(
+            "You are using `loss_function` with `$(expression_type)`. " *
+                "You should use `loss_function_expression` instead, as it is designed to work with expressions directly."
+        )
+    end
+
+    elementwise_loss = something(elementwise_loss, L2DistLoss())
+
     if complexity_mapping !== nothing
-        @assert complexity_of_operators === nothing &&
-            complexity_of_constants === nothing &&
-            complexity_of_variables === nothing
+        @assert all(
+            isnothing,
+            [complexity_of_operators, complexity_of_constants, complexity_of_variables],
+        )
     end
 
     #################################
     #### Supply defaults ############
     #! format: off
     _default_options = default_options(defaults)
-    binary_operators = something(binary_operators, _default_options.binary_operators)
-    unary_operators = something(unary_operators, _default_options.unary_operators)
     maxsize = something(maxsize, _default_options.maxsize)
     populations = something(populations, _default_options.populations)
     population_size = something(population_size, _default_options.population_size)
@@ -744,9 +805,14 @@ $(OPTION_DESCRIPTIONS)
     tournament_selection_p = something(tournament_selection_p, _default_options.tournament_selection_p)
     fraction_replaced = something(fraction_replaced, _default_options.fraction_replaced)
     fraction_replaced_hof = something(fraction_replaced_hof, _default_options.fraction_replaced_hof)
+    fraction_replaced_guesses = something(fraction_replaced_guesses, _default_options.fraction_replaced_guesses)
     topn = something(topn, _default_options.topn)
     batching = something(batching, _default_options.batching)
     batch_size = something(batch_size, _default_options.batch_size)
+    if !user_provided_operators
+        binary_operators = something(binary_operators, _default_options.operators.ops[2])
+        unary_operators = something(unary_operators, _default_options.operators.ops[1])
+    end
     #! format: on
     #################################
 
@@ -762,35 +828,112 @@ $(OPTION_DESCRIPTIONS)
 
     @assert maxsize > 3
     @assert warmup_maxsize_by >= 0.0f0
-    @assert length(unary_operators) <= 8192
-    @assert length(binary_operators) <= 8192
     @assert tournament_selection_n < population_size "`tournament_selection_n` must be less than `population_size`"
+    @assert loss_scale in (:log, :linear) "`loss_scale` must be either log or linear"
 
     # Make sure nested_constraints contains functions within our operator set:
-    _nested_constraints = build_nested_constraints(;
-        binary_operators, unary_operators, nested_constraints
-    )
+    _nested_constraints = if user_provided_operators
+        build_nested_constraints(; nested_constraints, operators_by_degree=operators.ops)
+    else
+        # Convert binary/unary to generic format for backwards compatibility
+        operators_tuple = (unary_operators, binary_operators)
+        build_nested_constraints(; nested_constraints, operators_by_degree=operators_tuple)
+    end
 
     if typeof(constraints) <: Tuple
-        constraints = collect(constraints)
+        constraints = Dict(constraints)
+    elseif constraints isa AbstractVector
+        constraints = Dict(constraints)
     end
     if constraints !== nothing
-        @assert bin_constraints === nothing
-        @assert una_constraints === nothing
-        # TODO: This is redundant with the checks in equation_search
-        for op in binary_operators
-            @assert !(op in unary_operators)
+        @assert all(isnothing, (bin_constraints, una_constraints))
+        if user_provided_operators
+            # For generic degree interface, constraints should be handled by the generic function
+            # Don't set bin_constraints/una_constraints as they shouldn't be used
+            all_operators = Set()
+            for ops in operators.ops
+                for op in ops
+                    if op ∈ all_operators
+                        error(
+                            "Operator $(op) appears in multiple degrees. " *
+                            "You can't use constraints.",
+                        )
+                    end
+                    push!(all_operators, op)
+                end
+            end
+        else
+            for op in binary_operators
+                @assert !(op in unary_operators)
+            end
+            for op in unary_operators
+                @assert !(op in binary_operators)
+            end
+            bin_constraints = constraints
+            una_constraints = constraints
         end
-        for op in unary_operators
-            @assert !(op in binary_operators)
+    else
+        # When constraints is nothing, we might still have individual bin_constraints/una_constraints
+        if user_provided_operators
+            @assert(
+                all(isnothing, (bin_constraints, una_constraints)),
+                "When using user_provided_operators=true, use the 'constraints' parameter instead of 'bin_constraints' and 'una_constraints'"
+            )
         end
-        bin_constraints = constraints
-        una_constraints = constraints
     end
 
-    _una_constraints, _bin_constraints = build_constraints(;
-        una_constraints, bin_constraints, unary_operators, binary_operators
-    )
+    if expression_spec !== nothing
+        @assert expression_type === nothing
+        @assert expression_options === nothing
+        @assert node_type === nothing
+
+        expression_type = get_expression_type(expression_spec)
+        expression_options = get_expression_options(expression_spec)
+        node_type = get_node_type(expression_spec)
+    else
+        if !all(isnothing, (expression_type, expression_options, node_type))
+            Base.depwarn(
+                "The `expression_type`, `expression_options`, and `node_type` arguments are deprecated. Use `expression_spec` instead, which populates these automatically.",
+                :Options,
+            )
+        end
+        _default_expression_spec = ExpressionSpec()
+        expression_type = @something(
+            expression_type, get_expression_type(_default_expression_spec)
+        )
+        expression_options = @something(
+            expression_options, get_expression_options(_default_expression_spec)
+        )
+        node_type = @something(node_type, default_node_type(expression_type))
+    end
+
+    node_type = with_max_degree_from_context(node_type, user_provided_operators, operators)
+
+    operators = if user_provided_operators && operators isa OperatorEnum
+        # Apply opmap to user-provided operators (e.g., log -> safe_log)
+        mapped_operators_by_degree = ntuple(length(operators.ops)) do i
+            map(opmap, operators.ops[i])
+        end
+        OperatorEnum(mapped_operators_by_degree)
+    else
+        operators
+    end
+
+    op_constraints = if user_provided_operators
+        @assert(
+            all(isnothing, (una_constraints, bin_constraints)),
+            "When using user_provided_operators=true, use the 'constraints' parameter instead of 'una_constraints' and 'bin_constraints'"
+        )
+
+        build_constraints(; constraints, operators_by_degree=operators.ops)
+    else
+        # Convert binary/unary to generic format for backwards compatibility
+        build_constraints(;
+            una_constraints,
+            bin_constraints,
+            operators_by_degree=(unary_operators, binary_operators),
+        )
+    end
 
     complexity_mapping = @something(
         complexity_mapping,
@@ -798,17 +941,18 @@ $(OPTION_DESCRIPTIONS)
             complexity_of_operators,
             complexity_of_variables,
             complexity_of_constants,
-            binary_operators,
-            unary_operators,
+            if user_provided_operators
+                operators.ops
+            else
+                (unary_operators, binary_operators)
+            end,
         )
     )
 
-    if maxdepth === nothing
-        maxdepth = maxsize
-    end
+    maxdepth = something(maxdepth, maxsize)
 
-    if define_helper_functions
-        # We call here so that mapped operators, like ^
+    if define_helper_functions && !user_provided_operators
+        # We call here so that mapped operators, like `^`
         # are correctly overloaded, rather than overloading
         # operators like "safe_pow", etc.
         OperatorEnum(;
@@ -819,15 +963,24 @@ $(OPTION_DESCRIPTIONS)
         )
     end
 
-    binary_operators = map(binopmap, binary_operators)
-    unary_operators = map(unaopmap, unary_operators)
-
-    operators = OperatorEnum(;
-        binary_operators=binary_operators,
-        unary_operators=unary_operators,
-        define_helper_functions=define_helper_functions,
-        empty_old_operators=false,
-    )
+    operators = if user_provided_operators
+        operators
+    else
+        binary_operators = map(opmap, binary_operators)
+        unary_operators = map(opmap, unary_operators)
+        if operator_enum_constructor !== nothing
+            operator_enum_constructor(;
+                binary_operators=binary_operators, unary_operators=unary_operators
+            )
+        else
+            OperatorEnum(;
+                binary_operators=binary_operators,
+                unary_operators=unary_operators,
+                define_helper_functions=define_helper_functions,
+                empty_old_operators=false,
+            )
+        end
+    end
 
     early_stop_condition = if typeof(early_stop_condition) <: Real
         # Need to make explicit copy here for this to work:
@@ -873,9 +1026,13 @@ $(OPTION_DESCRIPTIONS)
             output_directory
         end
 
+    nops = map(length, operators.ops)
+
     options = Options{
         typeof(complexity_mapping),
         operator_specialization(typeof(operators), expression_type),
+        typeof(nops),
+        typeof(op_constraints),
         node_type,
         expression_type,
         typeof(expression_options),
@@ -887,8 +1044,7 @@ $(OPTION_DESCRIPTIONS)
         print_precision,
     }(
         operators,
-        _bin_constraints,
-        _una_constraints,
+        op_constraints,
         complexity_mapping,
         tournament_selection_n,
         tournament_selection_p,
@@ -920,16 +1076,18 @@ $(OPTION_DESCRIPTIONS)
         ncycles_per_iteration,
         fraction_replaced,
         fraction_replaced_hof,
+        fraction_replaced_guesses,
         topn,
         verbosity,
         Val(print_precision),
         save_to_file,
         probability_negate_constant,
-        length(unary_operators),
-        length(binary_operators),
+        nops,
         seed,
         elementwise_loss,
         loss_function,
+        loss_function_expression,
+        loss_scale,
         node_type,
         expression_type,
         expression_options,
@@ -962,8 +1120,7 @@ function default_options(@nospecialize(version::Union{VersionNumber,Nothing} = n
     if version isa VersionNumber && version < v"1.0.0"
         return (;
             # Creating the Search Space
-            binary_operators=[+, -, /, *],
-            unary_operators=Function[],
+            operators=OperatorEnum(((), (+, -, /, *))),
             maxsize=20,
             # Setting the Search Size
             populations=15,
@@ -1000,6 +1157,7 @@ function default_options(@nospecialize(version::Union{VersionNumber,Nothing} = n
             # Migration between Populations
             fraction_replaced=0.00036,
             fraction_replaced_hof=0.035,
+            fraction_replaced_guesses=0.001,
             topn=12,
             # Performance and Parallelization
             batching=false,
@@ -1008,8 +1166,7 @@ function default_options(@nospecialize(version::Union{VersionNumber,Nothing} = n
     else
         return (;
             # Creating the Search Space
-            binary_operators=Function[+, -, /, *],
-            unary_operators=Function[],
+            operators=OperatorEnum(((), (+, -, /, *))),
             maxsize=30,
             # Setting the Search Size
             populations=31,
@@ -1049,6 +1206,7 @@ function default_options(@nospecialize(version::Union{VersionNumber,Nothing} = n
             ## but I thought this was a symptom of doing the sweep on such
             ## a small problem, so I increased it to the older value of 0.00036
             fraction_replaced_hof=0.0614,
+            fraction_replaced_guesses=0.001,
             topn=12,
             # Performance and Parallelization
             batching=false,

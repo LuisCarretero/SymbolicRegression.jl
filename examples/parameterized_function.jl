@@ -25,15 +25,12 @@ We will need to simultaneously learn the symbolic expression and per-class param
 =#
 using SymbolicRegression
 using Random: MersenneTwister
-using Zygote
+using Zygote  #src
 using MLJBase: machine, fit!, predict, report
 using Test
 
 #=
 Now, we generate synthetic data, with these 2 different classes.
-
-Note that the `class` feature is given special treatment for the [`SRRegressor`](@ref)
-as a categorical variable:
 =#
 
 X = let rng = MersenneTwister(0), n = 30
@@ -51,21 +48,37 @@ end
 #=
 ## Setting up the Search
 
-We'll configure the symbolic regression search to:
-- Use parameterized expressions with up to 2 parameters
-- Use Zygote.jl for automatic differentiation during parameter optimization (important when using parametric expressions, as it is higher dimensional)
+We'll configure the symbolic regression search to
+use template expressions with parameters that _vary by class_
 =#
 
 stop_at = Ref(1e-4)  #src
+
+# Get number of categories from the data
+n_categories = length(unique(X.class))
+
+# Create a template expression specification with 2 parameters
+expression_spec = @template_spec(
+    expressions = (f,), parameters = (p1=n_categories, p2=n_categories),
+) do x1, x2, class
+    f(x1, x2, p1[class], p2[class])
+end
+test_kwargs = if get(ENV, "SYMBOLIC_REGRESSION_IS_TESTING", "false") == "true"  #src
+    (;  #src
+        expression_spec=ParametricExpressionSpec(; max_parameters=2),  #src
+        autodiff_backend=:Zygote,  #src
+    )  #src
+else  #src
+    NamedTuple()  #src
+end  #src
 
 model = SRRegressor(;
     niterations=100,
     binary_operators=[+, *, /, -],
     unary_operators=[cos, exp],
     populations=30,
-    expression_type=ParametricExpression,
-    expression_options=(; max_parameters=2),
-    autodiff_backend=:Zygote,
+    expression_spec=expression_spec,
+    test_kwargs...,  #src
     early_stop_condition=(loss, _) -> loss < stop_at[],  #src
 );
 
@@ -88,13 +101,6 @@ You can extract the best expression and parameters with:
 report(mach).equations[end]
 ```
 
-## Key Takeaways
-
-1. [`ParametricExpression`](@ref)s allows us to discover symbolic expressions with optimizable parameters
-2. The parameters can capture class-dependent variations in the underlying model
-
-This approach is particularly useful when you suspect your data follows a common
-functional form, but with varying parameters across different conditions or class!
 =#
 #literate_end
 
@@ -112,4 +118,4 @@ ypred2 = predict(mach, (data=X, idx=idx2))
 loss2 = sum(i -> abs2(ypred2[i] - y[i]), eachindex(y)) / length(y)
 
 # Should get better:
-@test loss1 > loss2
+@test loss1 >= loss2

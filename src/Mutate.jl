@@ -1,5 +1,6 @@
 module MutateModule
 
+using DispatchDoctor: @unstable
 using DynamicExpressions:
     AbstractExpression,
     copy_into!,
@@ -15,15 +16,17 @@ using ..CoreModule:
     Dataset,
     RecordType,
     sample_mutation,
-    max_features
+    max_features,
+    dataset_fraction
 using ..ComplexityModule: compute_complexity
-using ..LossFunctionsModule: score_func, score_func_batched
+using ..LossFunctionsModule: eval_cost
 using ..CheckConstraintsModule: check_constraints
 using ..AdaptiveParsimonyModule: RunningSearchStatistics
 using ..PopMemberModule: PopMember
 using ..MutationFunctionsModule:
     mutate_constant,
     mutate_operator,
+    mutate_feature,
     swap_operands,
     append_random_op,
     prepend_random_op,
@@ -83,7 +86,7 @@ struct MutationResult{N<:AbstractExpression,P<:PopMember} <: AbstractMutationRes
 end
 
 """
-    condition_mutation_weights!(weights::AbstractMutationWeights, member::PopMember, options::AbstractOptions, curmaxsize::Int)
+    condition_mutation_weights!(weights::AbstractMutationWeights, member::PopMember, options::AbstractOptions, curmaxsize::Int, nfeatures::Int)
 
 Adjusts the mutation weights based on the properties of the current member and options.
 
@@ -96,9 +99,14 @@ Note that the weights were already copied, so you don't need to worry about muta
 - `member::PopMember`: The current population member being mutated.
 - `options::AbstractOptions`: The options that guide the mutation process.
 - `curmaxsize::Int`: The current maximum size constraint for the member's expression tree.
+- `nfeatures::Int`: The number of features available in the dataset.
 """
 function condition_mutation_weights!(
-    weights::AbstractMutationWeights, member::P, options::AbstractOptions, curmaxsize::Int
+    weights::AbstractMutationWeights,
+    member::P,
+    options::AbstractOptions,
+    curmaxsize::Int,
+    nfeatures::Int,
 ) where {T,L,N<:AbstractExpression,P<:PopMember{T,L,N}}
     tree = get_tree(member.tree)
     if !preserve_sharing(typeof(member.tree))
@@ -115,6 +123,8 @@ function condition_mutation_weights!(
         if !tree.constant
             weights.optimize = 0.0
             weights.mutate_constant = 0.0
+        else
+            weights.mutate_feature = 0.0
         end
         return nothing
     end
@@ -125,6 +135,11 @@ function condition_mutation_weights!(
     end
 
     condition_mutate_constant!(typeof(member.tree), weights, member, options, curmaxsize)
+
+    # Disable feature mutation if only one feature available
+    if nfeatures <= 1
+        weights.mutate_feature = 0.0
+    end
 
     complexity = compute_complexity(member, options)
 
@@ -159,7 +174,7 @@ end
 
 # Go through one simulated options.annealing mutation cycle
 #  exp(-delta/T) defines probability of accepting a change
-function next_generation(
+@unstable function next_generation(
     dataset::D,
     member::P,
     temperature,
@@ -174,18 +189,13 @@ function next_generation(
     num_evals = 0.0
 
     #TODO - reconsider this
-    beforeScore, beforeLoss = if options.batching
-        num_evals += (options.batch_size / dataset.n)
-        score_func_batched(dataset, member, options)
-    else
-        member.score, member.loss
-    end
+    before_cost, before_loss = member.cost, member.loss
 
     nfeatures = max_features(dataset, options)
 
     weights = copy(options.mutation_weights)
 
-    condition_mutation_weights!(weights, member, options, curmaxsize)
+    condition_mutation_weights!(weights, member, options, curmaxsize, nfeatures)
 
     mutation_choice = sample_mutation(weights)
 
@@ -197,12 +207,13 @@ function next_generation(
     #############################################
     # Mutations
     #############################################
-    local tree
+    # local tree
+    rtree = Ref{N}()
     while (!successful_mutation) && attempts < max_attempts
-        tree = copy_into!(node_storage, member.tree)
+        rtree[] = copy_into!(node_storage, member.tree)
 
         mutation_result = _dispatch_mutations!(
-            tree,
+            rtree[],
             member,
             mutation_choice,
             options.mutation_weights,
@@ -210,8 +221,8 @@ function next_generation(
             recorder=tmp_recorder,
             temperature,
             dataset,
-            score=beforeScore,
-            loss=beforeLoss,
+            cost=before_cost,
+            loss=before_loss,
             parent_ref,
             curmaxsize,
             nfeatures,
@@ -235,11 +246,13 @@ function next_generation(
                 mutation_result.tree isa N,
                 "Mutation result must return a tree if `return_immediately` is false"
             )
-            tree = mutation_result.tree::N
-            successful_mutation = check_constraints(tree, options, curmaxsize)
+            rtree[] = mutation_result.tree::N
+            successful_mutation = check_constraints(rtree[], options, curmaxsize)
             attempts += 1
         end
     end
+
+    tree = rtree[]
 
     if !successful_mutation
         @recorder begin
@@ -255,8 +268,8 @@ function next_generation(
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
-                beforeScore,
-                beforeLoss,
+                before_cost,
+                before_loss,
                 options,
                 compute_complexity(member, options);
                 parent=parent_ref,
@@ -267,15 +280,10 @@ function next_generation(
         )
     end
 
-    if options.batching
-        afterScore, afterLoss = score_func_batched(dataset, tree, options)
-        num_evals += (options.batch_size / dataset.n)
-    else
-        afterScore, afterLoss = score_func(dataset, tree, options)
-        num_evals += 1
-    end
+    after_cost, after_loss = eval_cost(dataset, tree, options)
+    num_evals += dataset_fraction(dataset)
 
-    if isnan(afterScore)
+    if isnan(after_cost)
         @recorder begin
             tmp_recorder["result"] = "reject"
             tmp_recorder["reason"] = "nan_loss"
@@ -289,8 +297,8 @@ function next_generation(
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
-                beforeScore,
-                beforeLoss,
+                before_cost,
+                before_loss,
                 options,
                 compute_complexity(member, options);
                 parent=parent_ref,
@@ -303,7 +311,8 @@ function next_generation(
 
     probChange = 1.0
     if options.annealing
-        delta = afterScore - beforeScore
+        # TODO: Try using log(after_cost) - log(before_cost) here
+        delta = after_cost - before_cost
         probChange *= exp(-delta / (temperature * options.alpha))
     end
     newSize = -1
@@ -337,8 +346,8 @@ function next_generation(
         return (
             PopMember(
                 copy_into!(node_storage, member.tree),
-                beforeScore,
-                beforeLoss,
+                before_cost,
+                before_loss,
                 options,
                 compute_complexity(member, options);
                 parent=parent_ref,
@@ -361,8 +370,8 @@ function next_generation(
         return (
             PopMember(
                 tree,
-                afterScore,
-                afterLoss,
+                after_cost,
+                after_loss,
                 options,
                 newSize;
                 parent=parent_ref,
@@ -416,7 +425,7 @@ You may overload this function to handle new mutation types for new `AbstractMut
 
 - `temperature`: The temperature parameter for annealing-based mutations.
 - `dataset::Dataset`: The dataset used for scoring.
-- `score`: The score of the member before mutation.
+- `cost`: The cost of the member before mutation.
 - `loss`: The loss of the member before mutation.
 - `curmaxsize`: The current maximum size constraint, which may be different from `options.maxsize`.
 - `nfeatures`: The number of features in the dataset.
@@ -483,6 +492,21 @@ end
 function mutate!(
     tree::N,
     member::P,
+    ::Val{:mutate_feature},
+    ::AbstractMutationWeights,
+    options::AbstractOptions;
+    recorder::RecordType,
+    nfeatures,
+    kws...,
+) where {N<:AbstractExpression,P<:PopMember}
+    tree = mutate_feature(tree, nfeatures)
+    @recorder recorder["type"] = "mutate_feature"
+    return MutationResult{N,P}(; tree=tree)
+end
+
+function mutate!(
+    tree::N,
+    member::P,
     ::Val{:swap_operands},
     ::AbstractMutationWeights,
     options::AbstractOptions;
@@ -536,10 +560,9 @@ function mutate!(
     ::AbstractMutationWeights,
     options::AbstractOptions;
     recorder::RecordType,
-    nfeatures,
     kws...,
 ) where {N<:AbstractExpression,P<:PopMember}
-    tree = delete_random_op!(tree, options, nfeatures)
+    tree = delete_random_op!(tree)
     @recorder recorder["type"] = "delete_node"
     return MutationResult{N,P}(; tree=tree)
 end
@@ -604,7 +627,7 @@ function mutate!(
     return MutationResult{N,P}(;
         member=PopMember(
             tree,
-            member.score,
+            member.cost,
             member.loss,
             options;
             parent=parent_ref,
@@ -665,7 +688,7 @@ function mutate!(
     return MutationResult{N,P}(;
         member=PopMember(
             tree,
-            member.score,
+            member.cost,
             member.loss,
             options,
             compute_complexity(tree, options);
@@ -678,7 +701,12 @@ end
 
 """Generate a generation via crossover of two members."""
 function crossover_generation(
-    member1::P, member2::P, dataset::D, curmaxsize::Int, options::AbstractOptions
+    member1::P,
+    member2::P,
+    dataset::D,
+    curmaxsize::Int,
+    options::AbstractOptions;
+    recorder::RecordType=RecordType(),
 )::Tuple{P,P,Bool,Float64} where {T,L,D<:Dataset{T,L},N,P<:PopMember{T,L,N}}
     tree1 = member1.tree
     tree2 = member2.tree
@@ -700,48 +728,47 @@ function crossover_generation(
             break
         end
         if num_tries > max_tries
+            @recorder begin
+                recorder["result"] = "reject"
+                recorder["reason"] = "failed_constraint_check"
+            end
             crossover_accepted = false
             return member1, member2, crossover_accepted, num_evals  # Fail.
         end
         child_tree1, child_tree2 = crossover_trees(tree1, tree2)
         num_tries += 1
     end
-    if options.batching
-        afterScore1, afterLoss1 = score_func_batched(
-            dataset, child_tree1, options; complexity=afterSize1
-        )
-        afterScore2, afterLoss2 = score_func_batched(
-            dataset, child_tree2, options; complexity=afterSize2
-        )
-        num_evals += 2 * (options.batch_size / dataset.n)
-    else
-        afterScore1, afterLoss1 = score_func(
-            dataset, child_tree1, options; complexity=afterSize1
-        )
-        afterScore2, afterLoss2 = score_func(
-            dataset, child_tree2, options; complexity=afterSize2
-        )
-        num_evals += options.batch_size / dataset.n
-    end
+    after_cost1, after_loss1 = eval_cost(
+        dataset, child_tree1, options; complexity=afterSize1
+    )
+    after_cost2, after_loss2 = eval_cost(
+        dataset, child_tree2, options; complexity=afterSize2
+    )
+    num_evals += 2 * dataset_fraction(dataset)
 
     baby1 = PopMember(
-        child_tree1,
-        afterScore1,
-        afterLoss1,
+        child_tree1::AbstractExpression,
+        after_cost1,
+        after_loss1,
         options,
         afterSize1;
         parent=member1.ref,
         deterministic=options.deterministic,
     )::P
     baby2 = PopMember(
-        child_tree2,
-        afterScore2,
-        afterLoss2,
+        child_tree2::AbstractExpression,
+        after_cost2,
+        after_loss2,
         options,
         afterSize2;
         parent=member2.ref,
         deterministic=options.deterministic,
     )::P
+
+    @recorder begin
+        recorder["result"] = "accept"
+        recorder["reason"] = "pass"
+    end
 
     crossover_accepted = true
     return baby1, baby2, crossover_accepted, num_evals
