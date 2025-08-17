@@ -468,6 +468,49 @@ function get_all_feature_combinations(feature_set::Set{Int}, feature_cnt::Int)
     end
 end
 
+function is_tree_valid(tree::AbstractExpressionNode{T})::Bool where {T}
+    try
+        # Basic structure checks
+        tree === nothing && return false
+        
+        # Check if we can access basic properties without crashing
+        degree = tree.degree
+        (degree < 0 || degree > 2) && return false
+        
+        # Check children based on degree
+        if degree >= 1
+            tree.l === nothing && return false
+            !is_tree_valid(tree.l) && return false
+        end
+        if degree == 2
+            tree.r === nothing && return false
+            !is_tree_valid(tree.r) && return false
+        end
+        
+        # Check if we can access other properties
+        if degree == 0
+            # For leaf nodes, check if we can access the value/feature
+            try
+                _ = tree.constant
+                _ = tree.feature
+            catch
+                return false
+            end
+        else
+            # For operator nodes, check if we can access the operator
+            try
+                _ = tree.op
+            catch
+                return false
+            end
+        end
+        
+        return true
+    catch
+        return false
+    end
+end
+
 function check_expr_similarity(
     subtree::AbstractExpressionNode{T}, 
     new_subtree::AbstractExpressionNode{T}, 
@@ -486,10 +529,14 @@ function check_expr_similarity(
     res = nothing
     res_new = nothing
     
+    # Evaluate (old) subtree
+    if !is_tree_valid(subtree)
+        increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
+        return false, Inf
+    end
     try
         (res, complete) = eval_tree_array(subtree, X, options.operators)
-        good = complete && all((res .< prevfloat(typemax(Float32))) .& (res .> nextfloat(typemin(Float32)))) && !any(isnan, res) && !any(isinf, res)
-        if !good
+        if !complete || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(Float32)) || x <= nextfloat(typemin(Float32)), res)
             increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
             return false, Inf
         end
@@ -498,11 +545,14 @@ function check_expr_similarity(
         return false, Inf
     end
     
-
+    # Evaluate new subtree
+    if !is_tree_valid(new_subtree)
+        increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
+        return false, Inf
+    end
     try
         (res_new, complete_new) = eval_tree_array(new_subtree, X, options.operators)
-        good_new = complete_new && all((res_new .< prevfloat(typemax(Float32))) .& (res_new .> nextfloat(typemin(Float32)))) && !any(isnan, res_new) && !any(isinf, res_new)
-        if !good_new
+        if !complete_new || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(Float32)) || x <= nextfloat(typemin(Float32)), res_new)
             increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
             return false, Inf
         end
