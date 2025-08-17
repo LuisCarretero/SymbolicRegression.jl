@@ -360,12 +360,9 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
         end
         x_out = x_out_batch[current_sample_idx, :, :]
 
-        if options.neural_options.require_novel_skeleton
-            novel = check_novel_skeleton(x_in, x_out, options)
-            if !novel
-                increment_stats!(STATS_REF[], :skeleton_not_novel, true)
-                continue
-            end
+        if options.neural_options.require_novel_skeleton && !check_novel_skeleton(x_in, x_out, options)
+            increment_stats!(STATS_REF[], :skeleton_not_novel, true)
+            continue
         end
 
         success, prods = logits_to_prods(x_out, options.neural_options.sample_logits)
@@ -376,12 +373,12 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
 
         feature_cnt = count(p -> p[2] == "'x1'", prods)
         if options.neural_options.subtree_max_features == 1  # Univariate decoding
-            feature_idx = length(feature_set) > 0 ? first(feature_set) : 1  # FIXME: Check if 
+            feature_idx = length(feature_set) > 0 ? first(feature_set) : 1
             success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], fill(feature_idx, feature_cnt), T)  # Creates subtree of same type as initial subtree
-            is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
         else  # Multivariate decoding
             success, new_subtree, is_similar, mse = multivariate_decoding(subtree, prods, feature_cnt, feature_set, options)
         end
+
         if !success
             increment_stats!(STATS_REF[], :tree_build_failures, true)
             continue
@@ -396,6 +393,10 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
         end
 
         if options.neural_options.require_expr_similarity
+            if options.neural_options.subtree_max_features == 1
+                is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
+            end
+
             if is_similar  # This is the best case: We found a similar expression that (if required above) is novel
                 increment_stats!(STATS_REF[], :returned_similar_exprs, true)
                 return true, new_subtree, mse
@@ -432,13 +433,16 @@ function multivariate_decoding(
     best_mse = Inf
     best_subtree = nothing
     best_is_similar = false
+
     for features in get_all_feature_combinations(feature_set, feature_cnt)
         increment_stats!(STATS_REF[], :multivardec_attempts, true)
+
         success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], features, T)
         if !success  # Tree build failed with this specific feature vector but will also fail with all others (skeleton is the same). Return.
             increment_stats!(STATS_REF[], :multivardec_totree_failures, true)
             return false, subtree, false, Inf
         end
+
         is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
         if mse == Inf
             continue
@@ -447,10 +451,12 @@ function multivariate_decoding(
             best_mse, best_subtree, best_is_similar = mse, new_subtree, is_similar
         end
     end
+
     if best_subtree === nothing
         increment_stats!(STATS_REF[], :multivardec_similarity_failures, true)
         return false, subtree, false, Inf
     end
+    
     return true, best_subtree, best_is_similar, best_mse
 end
 
@@ -468,49 +474,6 @@ function get_all_feature_combinations(feature_set::Set{Int}, feature_cnt::Int)
     end
 end
 
-function is_tree_valid(tree::AbstractExpressionNode{T})::Bool where {T}
-    try
-        # Basic structure checks
-        tree === nothing && return false
-        
-        # Check if we can access basic properties without crashing
-        degree = tree.degree
-        (degree < 0 || degree > 2) && return false
-        
-        # Check children based on degree
-        if degree >= 1
-            tree.l === nothing && return false
-            !is_tree_valid(tree.l) && return false
-        end
-        if degree == 2
-            tree.r === nothing && return false
-            !is_tree_valid(tree.r) && return false
-        end
-        
-        # Check if we can access other properties
-        if degree == 0
-            # For leaf nodes, check if we can access the value/feature
-            try
-                _ = tree.constant
-                _ = tree.feature
-            catch
-                return false
-            end
-        else
-            # For operator nodes, check if we can access the operator
-            try
-                _ = tree.op
-            catch
-                return false
-            end
-        end
-        
-        return true
-    catch
-        return false
-    end
-end
-
 function check_expr_similarity(
     subtree::AbstractExpressionNode{T}, 
     new_subtree::AbstractExpressionNode{T}, 
@@ -518,25 +481,20 @@ function check_expr_similarity(
     feature_cnt::Int=1
 )::Tuple{Bool, Float32} where {T}
     # FIXME: Make this hyperparams
-    # TODO: Check that Float32 is allowed
     if feature_cnt == 1
-        X = Matrix{Float32}(reshape(collect(range(-10.0, 10.0, length=40)), 1, :))
+        X = Matrix{T}(reshape(collect(range(T(-10), T(10), length=40)), 1, :))
     elseif feature_cnt > 1
         points_cnt = 40 * feature_cnt^2  # Is this a good scaling?
-        X = Matrix{Float32}(rand(Uniform(-10.0, 10.0), feature_cnt, points_cnt))
+        X = Matrix{T}(rand(Uniform(T(-10), T(10)), feature_cnt, points_cnt))
     end
     
     res = nothing
     res_new = nothing
     
     # Evaluate (old) subtree
-    if !is_tree_valid(subtree)
-        increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
-        return false, Inf
-    end
     try
         (res, complete) = eval_tree_array(subtree, X, options.operators)
-        if !complete || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(Float32)) || x <= nextfloat(typemin(Float32)), res)
+        if !complete || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(T)) || x <= nextfloat(typemin(T)), res)
             increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
             return false, Inf
         end
@@ -546,13 +504,9 @@ function check_expr_similarity(
     end
     
     # Evaluate new subtree
-    if !is_tree_valid(new_subtree)
-        increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
-        return false, Inf
-    end
     try
         (res_new, complete_new) = eval_tree_array(new_subtree, X, options.operators)
-        if !complete_new || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(Float32)) || x <= nextfloat(typemin(Float32)), res_new)
+        if !complete_new || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(T)) || x <= nextfloat(typemin(T)), res_new)
             increment_stats!(STATS_REF[], :new_tree_eval_failures, true)
             return false, Inf
         end
@@ -562,7 +516,8 @@ function check_expr_similarity(
     end
 
     # Calculate MSE
-    mse = sum((asinh.(res) .- asinh.(res_new)).^2) / size(X)[2]  # Using mean() is more efficient than sum()/n
+    mse_T = sum((asinh.(res) .- asinh.(res_new)).^2) / size(X)[2]
+    mse = Float32(mse_T)
     return mse < options.neural_options.similarity_threshold, mse
 end
 

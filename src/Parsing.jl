@@ -1,8 +1,9 @@
 module ParsingModule
 
-using SymbolicRegression: Node
+using DynamicExpressions: AbstractExpressionNode, Node
 using ..CoreModule: AbstractOptions
 using Distributions: Categorical
+
 
 # Define grammar rules similar to Python version
 # grammar_str = """
@@ -254,14 +255,58 @@ function logits_to_prods(  # FIXME: Think of better way than to just use global 
     return true, prods
 end
 
+function is_tree_valid(tree::AbstractExpressionNode{T})::Bool where {T}
+    try
+        # Basic structure checks
+        tree === nothing && return false
+        
+        # Check if we can access basic properties without crashing
+        degree = tree.degree
+        (degree < 0 || degree > 2) && return false
+        
+        # Check children based on degree
+        if degree >= 1
+            tree.l === nothing && return false
+            !is_tree_valid(tree.l) && return false
+        end
+        if degree == 2
+            tree.r === nothing && return false
+            !is_tree_valid(tree.r) && return false
+        end
+        
+        # Check if we can access other properties
+        if degree == 0
+            # For leaf nodes, check if we can access the value/feature
+            try
+                _ = tree.constant
+                _ = tree.feature
+            catch
+                return false
+            end
+        else
+            # For operator nodes, check if we can access the operator
+            try
+                _ = tree.op
+            catch
+                return false
+            end
+        end
+        
+        return true
+    catch
+        return false
+    end
+end
+
 function prods_to_tree(
     prods::Vector{Tuple{String, String}}, 
     OP_INDEX::Dict{String, Int}, 
     features::Vector{Int}, 
     tree_type::Type{T}
-)::Tuple{Bool, Union{Node{T}, Nothing}} where {T <: Number}
+)::Tuple{Bool, Node{T}} where {T <: Number}
     prefix_list = _prods_to_prefix(prods, OP_INDEX, features, tree_type)
     success, tree = _prefix_to_tree!(prefix_list)
+    !is_tree_valid(tree) && return false, Node{T}()
     return success, tree
 end
 
@@ -304,7 +349,7 @@ function _make_childless_op(degree::Int, op_index::Int, ::Type{T})::Node{T} wher
     return op_node
 end
 
-function _build_subtree(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}}} where {T<:Number}
+function _build_subtree(prefix_list::Vector{Node{T}})::Tuple{Bool, Node{T}} where {T<:Number}
     isempty(prefix_list) && return false, Node{T}()  # If prefix_list is empty initially or children are created but prefix_list stack is empty.
 
     node = popfirst!(prefix_list)
@@ -328,7 +373,7 @@ Copied from datagen/ExpressionGenerator.jl. Consolidate.
 
 First flag is ``success``, second flag is ``node``.
 """
-function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Tuple{Bool, Union{Node{T}, Nothing}} where {T<:Number}
+function _prefix_to_tree!(prefix_list::Vector{Node{T}})::Tuple{Bool, Node{T}} where {T<:Number}
     return _build_subtree(prefix_list)
 end
 
