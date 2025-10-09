@@ -242,9 +242,13 @@ Sample the logits of the neural network.
 Currently assuming single sample as input and then sample_count samples as output.
 """
 function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_count::Int=1)::AbstractArray{Float32}
-    input = Dict("onnx::Flatten_0" => reshape(x, (1, size(x)...)), "sample_eps" => [eps], "onnx::Reshape_2" => [sample_count])
+    input = Dict(
+        "input_syntax" => reshape(x, (1, size(x)...)), 
+        "sample_eps" => [eps], 
+        "sample_count" => [sample_count]
+    )
     raw_out = MODEL_REF[](input)
-    x_out = raw_out["314"]  # [1, :, :]  FIXME: Fix this naming
+    x_out = raw_out["output_logits"]
     return x_out
 end
 
