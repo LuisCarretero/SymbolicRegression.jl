@@ -356,13 +356,19 @@ TODO: Could use attempt to be more lenient as we come closer to failing otherwis
 Note that subtree may be multivariate but node_to_onehot replaces all features with a single one. Will have to map this back to the original features.
 """
 function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int}, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}, Float64} where {T}
-    
+
     # Keep track of candidates that pass all checks except similarity
     candidates = Vector{Tuple{AbstractExpressionNode{T}, Float64}}()
     current_sample_idx = Inf
     x_out_batch = nothing
 
-    # Encode the subtree into a one-hot vector
+    # Get the original feature used in the subtree
+    original_feature = length(feature_set) > 0 ? first(feature_set) : 1
+
+    # Remap original subtree to x1 for evaluation (no-op if already x1)
+    subtree_x1 = remap_features(subtree, original_feature, 1)
+
+    # Encode the subtree into a one-hot vector (structure only, feature doesn't affect encoding)
     encode_success, x_in = node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[])
     if !encode_success
         increment_stats!(STATS_REF[], :encoding_failures, true)
@@ -391,53 +397,97 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
             increment_stats!(STATS_REF[], :decoding_failures, true)
             continue
         end
-
-        feature_cnt = count(p -> p[2] == "'x1'", prods)
-        if options.neural_options.subtree_max_features == 1  # Univariate decoding
-            feature_idx = length(feature_set) > 0 ? first(feature_set) : 1
-            success, new_subtree = prods_to_tree(prods, OP_INDEX_REF[], fill(feature_idx, feature_cnt), T)  # Creates subtree of same type as initial subtree
-        else  # Multivariate decoding
-            success, new_subtree, is_similar, mse = multivariate_decoding(subtree, prods, feature_cnt, feature_set, options)
-        end
-
-        if !success
-            increment_stats!(STATS_REF[], :tree_build_failures, true)
-            continue
-        end
         
-        if options.neural_options.require_tree_size_similarity  # FIXME: Could move this into multivariate_decoding so that we don't run whole routine if we know tree size is invalid anyways
-            good = verify_tree_size_similar(subtree, new_subtree, options)
-            if !good
-                increment_stats!(STATS_REF[], :tree_comparison_failures, true)
+        # Sampling model is implicitly univariate and returns only x1 as features after decoding via `logits_to_prods`
+        feature_cnt_new = count(p -> p[2] == "'x1'", prods)
+
+        if options.neural_options.subtree_max_features == 1  # Univariate decoding
+            # Always generate with feature 1 for evaluation
+            success, new_subtree_x1 = prods_to_tree(prods, OP_INDEX_REF[], fill(1, feature_cnt_new), T)
+
+            if !success
+                increment_stats!(STATS_REF[], :tree_build_failures, true)
                 continue
             end
-        end
 
-        if options.neural_options.require_expr_similarity
-            if options.neural_options.subtree_max_features == 1
-                is_similar, mse = check_expr_similarity(subtree, new_subtree, options, feature_cnt)
+            if options.neural_options.require_tree_size_similarity
+                good = verify_tree_size_similar(subtree, new_subtree_x1, options)
+                if !good
+                    increment_stats!(STATS_REF[], :tree_comparison_failures, true)
+                    continue
+                end
             end
 
-            if is_similar  # This is the best case: We found a similar expression that (if required above) is novel
-                increment_stats!(STATS_REF[], :returned_similar_exprs, true)
-                return true, new_subtree, mse
+            if options.neural_options.require_expr_similarity
+                # Compare both using x1 (matches EVAL_X_UNIVARIATE_REF dimensions)
+                is_similar, mse = check_expr_similarity(subtree_x1, new_subtree_x1, options, feature_cnt_new)
+
+                if is_similar
+                    increment_stats!(STATS_REF[], :returned_similar_exprs, true)
+                    # Remap back to original feature before returning
+                    new_subtree = remap_features(new_subtree_x1, 1, original_feature)
+                    return true, new_subtree, mse
+                else
+                    increment_stats!(STATS_REF[], :expr_similarity_failures, true)
+                    # Store x1 version in candidates
+                    push!(candidates, (new_subtree_x1, mse))
+                end
             else
-                increment_stats!(STATS_REF[], :expr_similarity_failures, true)
-                push!(candidates, (new_subtree, mse))
+                # No similarity requirement - remap and return immediately
+                new_subtree = remap_features(new_subtree_x1, 1, original_feature)
+                return true, new_subtree, Inf
             end
-        else
-            return true, new_subtree, Inf
+
+        else  # Multivariate decoding
+            # multivariate_decoding handles feature combinations and similarity checks internally
+            success, new_subtree, is_similar, mse = multivariate_decoding(subtree, prods, feature_cnt_new, feature_set, options)
+
+            if !success
+                increment_stats!(STATS_REF[], :tree_build_failures, true)
+                continue
+            end
+
+            if options.neural_options.require_tree_size_similarity
+                good = verify_tree_size_similar(subtree, new_subtree, options)
+                if !good
+                    increment_stats!(STATS_REF[], :tree_comparison_failures, true)
+                    continue
+                end
+            end
+
+            if options.neural_options.require_expr_similarity
+                # multivariate_decoding already checked similarity
+                if is_similar
+                    increment_stats!(STATS_REF[], :returned_similar_exprs, true)
+                    return true, new_subtree, mse
+                else
+                    increment_stats!(STATS_REF[], :expr_similarity_failures, true)
+                    push!(candidates, (new_subtree, mse))
+                end
+            else
+                # No similarity requirement - return immediately
+                return true, new_subtree, Inf
+            end
         end
     end
 
     # If we have candidates that failed only the similarity check, return the best one
     if !isempty(candidates)
         best_candidate = argmin(c -> c[2], candidates)
-        new_subtree, mse = best_candidate
+        candidate_subtree, mse = best_candidate
+
+        if options.neural_options.subtree_max_features == 1
+            # Univariate candidates stored with x1 - remap back to original feature
+            new_subtree = remap_features(candidate_subtree, 1, original_feature)
+        else
+            # Multivariate candidates already have correct features
+            new_subtree = candidate_subtree
+        end
+
         increment_stats!(STATS_REF[], :returned_nonsimilar_exprs, true)
         return true, new_subtree, mse
     end
-    
+
     return false, subtree, Inf
 end
 
@@ -597,6 +647,45 @@ function replace_subtree(
         end
     end
     return tree
+end
+
+"""
+    remap_features(tree::AbstractExpressionNode{T}, from_feature::Int, to_feature::Int)::AbstractExpressionNode{T}
+
+Creates a copy of the tree with all variable nodes using from_feature remapped to to_feature.
+Returns a new tree, leaving the original unchanged.
+
+Early returns if from_feature == to_feature to avoid unnecessary copying (optimization for x1-only cases).
+"""
+function remap_features(tree::AbstractExpressionNode{T}, from_feature::Int, to_feature::Int)::AbstractExpressionNode{T} where T
+    # Optimization: if features are the same, no remapping needed
+    if from_feature == to_feature
+        return tree
+    end
+
+    # Create a copy of the current node
+    new_node = typeof(tree)()
+    new_node.degree = tree.degree
+
+    if tree.degree == 0
+        # Leaf node
+        new_node.constant = tree.constant
+        if tree.constant
+            new_node.val = tree.val
+        else
+            # Variable node - remap if matches
+            new_node.feature = (tree.feature == from_feature) ? to_feature : tree.feature
+        end
+    else
+        # Operator node
+        new_node.op = tree.op
+        new_node.l = remap_features(tree.l, from_feature, to_feature)
+        if tree.degree == 2
+            new_node.r = remap_features(tree.r, from_feature, to_feature)
+        end
+    end
+
+    return new_node
 end
 
 end
