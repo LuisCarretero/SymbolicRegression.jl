@@ -21,6 +21,22 @@ function is_commutative(op::Integer, options::Options)
 end
 
 """
+    is_constant(node)
+
+Check if a node represents a constant (not a variable).
+Constants are leaf nodes (degree 0) that are not variables.
+"""
+function is_constant(T::Node)
+    # Only leaf nodes can be constants or variables
+    T.degree != 0 && return false
+
+    # Check if it's a constant (has numeric value) or variable (feature)
+    # In DynamicExpressions, constants have !T.constant == false
+    # and variables have T.feature != 0
+    return !T.constant || T.feature == 0
+end
+
+"""
     tree_edit_distance(T1, T2, options)
 
 Compute the tree edit distance between two expression trees.
@@ -41,8 +57,18 @@ function tree_edit_distance(T1::Node, T2::Node, options::Options)::Float32
     T2.degree == 2 && push!(children2, T2.r)
 
     # One or both nodes are leaves
-    isempty(children1) && return sum([cost_insert_tree(child) for child in children2], init=0.0)
-    isempty(children2) && return sum([cost_delete_tree(child) for child in children1], init=0.0)
+    if isempty(children1) && isempty(children2)
+        # Both are leaves - check if both are constants
+        if is_constant(T1) && is_constant(T2)
+            return 0.0  # All constants treated as equal
+        end
+        # Otherwise compare values (for variables)
+        return T1.val == T2.val ? 0.0 : 1.0
+    elseif isempty(children1)
+        return sum([cost_insert_tree(child) for child in children2], init=0.0)
+    elseif isempty(children2)
+        return sum([cost_delete_tree(child) for child in children1], init=0.0)
+    end
 
     # Compute the substitution cost for the roots
     substitution_cost = cost_substitute(T1, T2)
@@ -146,7 +172,7 @@ function cost_substitute(T1::Node, T2::Node)
     if T1.degree == T2.degree
         return T1.op == T2.op ? 0.0 : 1.0
     else
-        return 0.0
+        return 1.0  # FIX: Different arity has cost 1.0, not 0.0
     end
 end
 

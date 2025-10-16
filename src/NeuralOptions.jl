@@ -14,9 +14,15 @@ Base.@kwdef mutable struct NeuralOptions
     require_novel_skeleton::Bool = true
     require_expr_similarity::Bool = true
     similarity_threshold::Float64 = 0.2
-    sample_batchsize::Int = 10  # 
+    sample_batchsize::Int = 10  #
     sample_logits::Bool = true  # If false, use argmax to sample.
     subtree_max_features::Int = 1
+
+    # Expression similarity evaluation settings
+    eval_min::Float64 = -10.0
+    eval_max::Float64 = 10.0
+    eval_npoints::Int = 40
+    eval_transform::String = "asinh"  # "asinh" or "identity"
 
     # Loggings
     verbose::Bool = false

@@ -26,6 +26,8 @@ const OP_TO_LOGITS_REF = Ref{Dict{Tuple{Int,Int}, Int}}(Dict{Tuple{Int,Int}, Int
 const OPTIONS_REF = Ref{Union{Nothing, AbstractOptions}}(nothing)
 const ENABLED_REF = Ref{Bool}(false)
 const STATS_LOCK = ReentrantLock()
+const EVAL_X_UNIVARIATE_REF = Ref{Union{Nothing, Matrix}}(nothing)
+const EVAL_TRANSFORM_REF = Ref{Function}(identity)
 
 zero_sqrt(x) = x >= 0 ? sqrt(x) : zero(x)
 
@@ -171,7 +173,6 @@ function setup_module(options::AbstractOptions)
     
     try
         ops = [options.operators.binops..., options.operators.unaops...]
-        @info("ops: $ops")
         # Assert all required operators are present. FIXME: Make this dynamic, dependent on loaded sampling model
         function check_op(op_name, ops)
             any(op -> string(op) == op_name, ops) || error("$op_name operator not found in options")
@@ -211,10 +212,26 @@ function setup_module(options::AbstractOptions)
         end
         OP_TO_LOGITS_REF[] = op_to_logits
 
-        # println("op_index: $op_index")
-        # println("op_to_logits: $op_to_logits")
         OP_INDEX_REF[] = op_index
         OP_TO_LOGITS_REF[] = op_to_logits
+
+        # Pre-compute evaluation data for similarity checks
+        # Get the transform function by name
+        transform_name = options.neural_options.eval_transform
+        try
+            EVAL_TRANSFORM_REF[] = getfield(Main, Symbol(transform_name))
+        catch
+            error("Invalid eval_transform: $transform_name. Function not found in Main module.")
+        end
+        # Pre-compute univariate X (always the same size)
+        T = Float32  # Use Float32 for consistency with neural network operations
+        EVAL_X_UNIVARIATE_REF[] = Matrix{T}(reshape(
+            collect(range(T(options.neural_options.eval_min),
+                          T(options.neural_options.eval_max),
+                          length=options.neural_options.eval_npoints)),
+            1, :
+        ))
+
         reset_mutation_stats!()
         ENABLED_REF[] = true
     catch e
@@ -479,17 +496,17 @@ function get_all_feature_combinations(feature_set::Set{Int}, feature_cnt::Int)
 end
 
 function check_expr_similarity(
-    subtree::AbstractExpressionNode{T}, 
-    new_subtree::AbstractExpressionNode{T}, 
+    subtree::AbstractExpressionNode{T},
+    new_subtree::AbstractExpressionNode{T},
     options::AbstractOptions,
     feature_cnt::Int=1
 )::Tuple{Bool, Float32} where {T}
-    # FIXME: Make this hyperparams
     if feature_cnt == 1
-        X = Matrix{T}(reshape(collect(range(T(-10), T(10), length=40)), 1, :))
+        # Use pre-computed univariate X
+        X = Matrix{T}(EVAL_X_UNIVARIATE_REF[])
     elseif feature_cnt > 1
-        points_cnt = 40 * feature_cnt^2  # Is this a good scaling?
-        X = Matrix{T}(rand(Uniform(T(-10), T(10)), feature_cnt, points_cnt))
+        points_cnt = options.neural_options.eval_npoints * feature_cnt^2  # Is this a good scaling?
+        X = Matrix{T}(rand(Uniform(T(options.neural_options.eval_min), T(options.neural_options.eval_max)), feature_cnt, points_cnt))
     end
     
     res = nothing
@@ -519,8 +536,9 @@ function check_expr_similarity(
         return false, Inf
     end
 
-    # Calculate MSE
-    mse_T = sum((asinh.(res) .- asinh.(res_new)).^2) / size(X)[2]
+    # Calculate MSE with configured transform
+    transform = EVAL_TRANSFORM_REF[]
+    mse_T = sum((transform.(res) .- transform.(res_new)).^2) / size(X)[2]
     mse = Float32(mse_T)
     return mse < options.neural_options.similarity_threshold, mse
 end
