@@ -30,10 +30,10 @@ function is_constant(T::Node)
     # Only leaf nodes can be constants or variables
     T.degree != 0 && return false
 
-    # Check if it's a constant (has numeric value) or variable (feature)
-    # In DynamicExpressions, constants have !T.constant == false
-    # and variables have T.feature != 0
-    return !T.constant || T.feature == 0
+    # Check if it's a constant
+    # In DynamicExpressions, constants have T.constant == true
+    # and variables have T.constant == false (and T.feature != 0)
+    return T.constant
 end
 
 """
@@ -58,12 +58,20 @@ function tree_edit_distance(T1::Node, T2::Node, options::Options)::Float32
 
     # One or both nodes are leaves
     if isempty(children1) && isempty(children2)
-        # Both are leaves - check if both are constants
-        if is_constant(T1) && is_constant(T2)
-            return 0.0  # All constants treated as equal
+        # Both are leaves
+        is_const1 = is_constant(T1)
+        is_const2 = is_constant(T2)
+
+        if is_const1 && is_const2
+            # Both are constants - treat all constants as equal
+            return 0.0
+        elseif is_const1 != is_const2
+            # One constant, one variable - different
+            return 1.0
+        else
+            # Both variables - compare feature indices
+            return T1.feature == T2.feature ? 0.0 : 1.0
         end
-        # Otherwise compare values (for variables)
-        return T1.val == T2.val ? 0.0 : 1.0
     elseif isempty(children1)
         return sum([cost_insert_tree(child) for child in children2], init=0.0)
     elseif isempty(children2)
