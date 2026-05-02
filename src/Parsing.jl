@@ -98,6 +98,91 @@ end
 grammar_str = _split_grammar_rules(GRAMMAR_STR_RAW)
 grammar_masks, allowed_prod_idx, unique_lhs = _create_grammar_masks(grammar_str)
 
+"""
+    GrammarRule
+
+Per-rule precomputed metadata used by `logits_to_prods` / `_prods_to_prefix`.
+Built once from `grammar_str` at module load — eliminates the per-call
+`split`/`replace`/`match` work that previously ran on every iteration of the
+decode loop (which is called ~13× per `logits_to_prods` × thousands of calls
+per neural mutation run).
+
+Fields:
+- `lhs`        : LHS symbol, e.g. "S" or "END"
+- `lhs_idx`    : index of `lhs` in `unique_lhs` (1-based)
+- `rhs`        : raw RHS string, kept for backward-compatible `(lhs, rhs)`
+                  output — for CON rules this slot is overwritten per-call
+                  with the decoded constant.
+- `op_name`    : operator name inside quotes (e.g. "ADD", "SIN", "x1"),
+                  or "" for the END rule.
+- `arity`      : 0/1/2 for op rules, -1 for CON, -2 for END (used as a fast
+                  switch in `_prods_to_prefix_indexed`).
+- `is_end`     : true for the "END -> 'END'" rule.
+- `is_con`     : true for the "S -> 'CON'" rule.
+- `is_var`     : true for the variable rule (e.g. "S -> 'x1'").
+- `n_nonterm`  : number of nonterminals in RHS to push onto the parse stack.
+- `nonterm_lhs_idx`: vector of `unique_lhs` indices to push (in *forward* order
+                  — the consumer pushes in reverse so we don't reverse here).
+"""
+struct GrammarRule
+    lhs::String
+    lhs_idx::Int
+    rhs::String
+    op_name::String
+    arity::Int
+    is_end::Bool
+    is_con::Bool
+    is_var::Bool
+    n_nonterm::Int
+    nonterm_lhs_idx::Vector{Int}
+end
+
+const _OP_QUOTE_RE = r"'([^']+)'"
+
+function _build_grammar_rules(g_str::String, ulhs::Vector{String})::Vector{GrammarRule}
+    out = GrammarRule[]
+    lhs_to_idx = Dict{String,Int}(s => i for (i, s) in enumerate(ulhs))
+    for line in split(g_str, "\n")
+        sline = strip(line)
+        isempty(sline) && continue
+        lhs_raw, rhs_raw = split(sline, "->")
+        lhs = String(strip(lhs_raw))
+        rhs = String(strip(rhs_raw))
+        m = match(_OP_QUOTE_RE, rhs)
+        op_name = m === nothing ? "" : String(m.captures[1])
+        is_end = (lhs == "END")
+        is_con = (op_name == "CON")
+        # Variable rule has no arity entry in OPERATOR_ARITY for "x1" with a
+        # non-zero arity, but we tag it explicitly via OPERATOR_ARITY[op]==0
+        # (the convention used throughout this file).
+        arity = if is_end
+            -2
+        elseif is_con
+            -1
+        elseif haskey(OPERATOR_ARITY, op_name)
+            OPERATOR_ARITY[op_name]
+        else
+            error("Unknown op in grammar rule: $rhs")
+        end
+        is_var = (arity == 0 && !is_con && !is_end)
+        # Walk RHS tokens after the quoted op, picking up nonterminals to push.
+        # E.g. for "'ADD' S S" we get ["S","S"]; for "'CON'" we get [].
+        nonterm = Int[]
+        for tok in split(rhs)
+            clean = replace(tok, "'" => "")
+            if haskey(lhs_to_idx, clean)
+                push!(nonterm, lhs_to_idx[clean])
+            end
+        end
+        push!(out, GrammarRule(lhs, lhs_to_idx[lhs], rhs, op_name, arity,
+                               is_end, is_con, is_var, length(nonterm), nonterm))
+    end
+    return out
+end
+
+const GRAMMAR_RULES = _build_grammar_rules(grammar_str, unique_lhs)
+const _LHS_TO_IDX = Dict{String,Int}(s => i for (i, s) in enumerate(unique_lhs))
+
 mutable struct nn_config
     nbin::Int
     nuna::Int
@@ -177,81 +262,108 @@ end
 Convert logits to production rules.
 First flag is ``success``, second flag is ``prods``.
 
-Uses GRAMMAR to get mapping from token_idx -> op_string.
+Uses the precomputed `GRAMMAR_RULES` table to look up parsed rule metadata
+(LHS, RHS, nonterminals to push) — eliminating the per-call grammar string
+splits that previously dominated this function.
 """
-function logits_to_prods(  # FIXME: Think of better way than to just use global vars for grammar_masks, etc.
+function logits_to_prods(
     logits::Matrix{Float32},
-    sample::Bool=false, 
+    sample::Bool=false,
     max_length::Int=15
 )::Tuple{Bool, Union{Vector{Tuple{String, String}}, Nothing}}
-    # Initialize empty stack with start symbol 'S'
-    stack = ["S"]
-    
-    # Split logits into productions and constants
-    logits_prods = clamp.(logits[:, 1:end-1], -84.0f0, 84.0f0) # Clamp to avoid overflow in exp(x) and sum(exp(x)) for Float32 ( log(floatmax(Float32)/Ncats) )
-    constants = logits[:, end]
-    
-    prods = []
-    t = 1
-    
-    while !isempty(stack)
-        alpha = pop!(stack)  # Current LHS toke
-        
-        # Get mask for current symbol
-        symbol_idx = findfirst(==(alpha), unique_lhs)
-        mask = grammar_masks[symbol_idx, :]
-        
-        # Calculate probabilities
-        probs = mask .* exp.(logits_prods[t, :])
-        tot = sum(probs)
-        if tot == 0 || !isfinite(tot)
-            return (false, nothing)  # No valid productions or numerical issues
-        end
-        probs = probs ./ tot
-        if !isapprox(sum(probs), one(Float32))  # Same test as in Categorical() to not throw errors
-            return (false, nothing)  # Check for NaN/Inf and verify distribution sums to 1
-        end
-        
-        # Select production rule
-        if sample
-            i = rand(Categorical(probs))
-        else
-            _, i = findmax(probs)
-        end
-        
-        # Get selected rule
-        rule = split(grammar_str, "\n")[i]
-        lhs, rhs = split(strip(rule), "->")
-        lhs = strip(lhs)
-        rhs = strip(rhs)
+    # Stack holds `unique_lhs` indices, not strings — the only LHS symbols that
+    # ever land here are members of `unique_lhs` (we filter them at table-build
+    # time), so this is exact and avoids string compares.
+    n_lhs = length(unique_lhs)
+    n_rules = length(GRAMMAR_RULES)
+    n_cats = size(grammar_masks, 2)
+    @assert n_rules == n_cats
 
-        if lhs == "END"
-            break
-        end
-        
-        # If rule produces CONST, replace with actual constant
-        if rhs == "'CON'"
-            rhs = string(constants[t])
-        end
-        
-        # Add production to list
-        push!(prods, (lhs, rhs))
-        
-        # Add RHS nonterminals to stack in reverse order
-        rhs_symbols = split(rhs)
-        for symbol in reverse(rhs_symbols)
-            clean_symbol = replace(symbol, "'" => "")
-            if clean_symbol in unique_lhs
-                push!(stack, clean_symbol)
+    # `S` is index 1, but be explicit:
+    stack = Int[_LHS_TO_IDX["S"]]
+    sizehint!(stack, max_length)
+
+    prods = Tuple{String,String}[]
+    sizehint!(prods, max_length)
+
+    # Reused per-step probability buffer.
+    probs = Vector{Float32}(undef, n_rules)
+
+    t = 1
+    while !isempty(stack)
+        alpha_idx = pop!(stack)
+
+        # Compute mask .* exp(clamp(logits[t, :], -84, 84)) into `probs`.
+        @inbounds for j in 1:n_rules
+            if grammar_masks[alpha_idx, j]
+                lj = logits[t, j]
+                if lj < -84.0f0
+                    lj = -84.0f0
+                elseif lj > 84.0f0
+                    lj = 84.0f0
+                end
+                probs[j] = exp(lj)
+            else
+                probs[j] = 0.0f0
             end
         end
-        
+
+        tot = zero(Float32)
+        @inbounds for j in 1:n_rules
+            tot += probs[j]
+        end
+        if tot == 0 || !isfinite(tot)
+            return (false, nothing)
+        end
+        inv_tot = one(Float32) / tot
+        @inbounds for j in 1:n_rules
+            probs[j] *= inv_tot
+        end
+
+        # Optional renormalization sanity check (matches the Categorical()
+        # tolerance in the previous implementation).
+        s = zero(Float32)
+        @inbounds for j in 1:n_rules
+            s += probs[j]
+        end
+        if !isapprox(s, one(Float32))
+            return (false, nothing)
+        end
+
+        # Select production rule (1-based index into GRAMMAR_RULES).
+        i = if sample
+            rand(Categorical(probs))
+        else
+            argmax_idx = 1
+            best = probs[1]
+            @inbounds for j in 2:n_rules
+                if probs[j] > best
+                    best = probs[j]
+                    argmax_idx = j
+                end
+            end
+            argmax_idx
+        end
+
+        rule = @inbounds GRAMMAR_RULES[i]
+        rule.is_end && break
+
+        # Build the (lhs, rhs) tuple. For CON rules, materialize the literal.
+        rhs_str = rule.is_con ? string(@inbounds logits[t, end]) : rule.rhs
+        push!(prods, (rule.lhs, rhs_str))
+
+        # Push nonterminals in reverse order (matches the prior `for ... in
+        # reverse(rhs_symbols)` loop).
+        @inbounds for k in length(rule.nonterm_lhs_idx):-1:1
+            push!(stack, rule.nonterm_lhs_idx[k])
+        end
+
         t += 1
         if t > max_length
             break
         end
     end
-    
+
     return true, prods
 end
 
@@ -315,23 +427,35 @@ Taken productions in the form (lhs, rhs) and convert prefix list of nodes with o
 
 Needs mapping from (op_deg, op_idx) -> token_idx.
 """
+# Extract `op_name` from an RHS like `"'ADD' S S"` or `"'CON'"`. Returns `nothing`
+# when the RHS has no leading single-quoted token (i.e. the constant slot, where
+# the rhs string is the literal numeric value, e.g. "0.123"). Faster than
+# `match(r"'([^']+)'", s)` because it skips the Regex compile/dispatch overhead
+# on the hot decode path.
+@inline function _rhs_op_name(rhs::AbstractString)::Union{String, Nothing}
+    n = ncodeunits(rhs)
+    n >= 2 || return nothing
+    @inbounds first(rhs) == '\'' || return nothing
+    j = findnext('\'', rhs, 2)
+    j === nothing && return nothing
+    return String(SubString(rhs, 2, prevind(rhs, j)))
+end
+
 function _prods_to_prefix(prods::Vector{Tuple{String, String}}, OP_INDEX::Dict{String, Int}, features::Vector{Int}, tree_type::Type{T})::Vector{Node{T}} where {T <: Number}
-    prefix_list = []
+    prefix_list = Node{T}[]
+    sizehint!(prefix_list, length(prods))
     i = 1
     for prod in prods
-        op_match = match(r"'([^']+)'", prod[2])  # Alternatively, use prod to infer arity?
-        if op_match !== nothing
-            op = op_match.captures[1]
+        op = _rhs_op_name(prod[2])
+        if op !== nothing
             arity = OPERATOR_ARITY[op]
             if arity == 0
                 push!(prefix_list, Node{T}(; feature=features[i]))
                 i += 1
-            elseif arity == 1
-                push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], T))
-            elseif arity == 2
+            else
                 push!(prefix_list, _make_childless_op(arity, OP_INDEX[op], T))
             end
-        else  # Constant
+        else  # Constant — rhs is the literal numeric string
             push!(prefix_list, Node{T}(; val=parse(T, prod[2])))
         end
     end
