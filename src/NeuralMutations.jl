@@ -344,6 +344,7 @@ function load_model(options::AbstractOptions)
     if !_MODEL_HAS_SAMPLE_COUNT[]
         @info "ONNX model uses baked sample_count contract (T1.1): sample_count not passed per call; sample_eps is Float32."
     end
+    _build_fast_inference_state!(MODEL_REF[])
 end
 
 # ORT graph optimization levels (from onnxruntime_c_api.h GraphOptimizationLevel)
@@ -457,6 +458,41 @@ check — no string lookup.
 """
 const _MODEL_HAS_SAMPLE_COUNT = Ref{Bool}(true)
 
+# Fast-path inference state. Built once at session-load to avoid the per-call
+# `Dict` / `prepare_inputs` / `make_output` work in ONNXRunTime.jl's high-level
+# wrapper:
+#
+#   * `input_syntax_buf` and `sample_eps_buf[/_count_buf]` are Julia-owned
+#     buffers; we mutate their contents in place per call. The pre-built
+#     `OrtValue`s in `input_ortvalues` were created from these vectors via
+#     `CreateTensorWithDataAsOrtValue`, which uses the buffer pointer
+#     directly — so each `Run` reads whatever we wrote last.
+#   * `output_ortvalue_ref` holds the most recent output `OrtValue` alive
+#     across calls. That lets us return a zero-copy `unsafe_GetTensorMutableData`
+#     view instead of the high-level path's `copy(parent(...))` (which was a
+#     fresh ~92 KB host allocation + memcpy on every call). The previous
+#     output is dropped — and ORT-released — when the *next* call replaces it.
+#     Safe because `sample_routine` consumes all `@view` slices into batch i
+#     before triggering the next inference call.
+#
+# All paths bypass `(::InferenceSession)(inputs)` and call `api.Run` via ccall.
+mutable struct _FastInferenceState
+    api::ORT.CAPI.OrtApi
+    session::ORT.CAPI.OrtSession
+    input_syntax_buf::Vector{Float32}        # length 180 = 1*15*12 (row-major)
+    sample_eps_f32_buf::Vector{Float32}      # length 1, baked contract
+    sample_eps_f64_buf::Vector{Float64}      # length 1, legacy contract
+    sample_count_buf::Vector{Int64}          # length 1, legacy contract only
+    input_ortvalues::Vector{ORT.OrtValue}    # 2 (baked) or 3 (legacy)
+    input_name_cstrings::Vector{Cstring}
+    output_name_cstrings::Vector{Cstring}
+    input_name_storage::Vector{String}       # keeps Cstrings alive
+    output_name_storage::Vector{String}
+    output_ortvalue_ref::Ref{Union{Nothing, ORT.OrtValue}}
+end
+
+const _FAST_STATE = Ref{Union{Nothing, _FastInferenceState}}(nothing)
+
 function _init_model_input_contract!(sess::ORT.InferenceSession)
     _MODEL_HAS_SAMPLE_COUNT[] = "sample_count" in sess.input_names
     # `sample_eps` element type is implied by the contract (legacy=Float64,
@@ -466,23 +502,119 @@ function _init_model_input_contract!(sess::ORT.InferenceSession)
     return nothing
 end
 
-function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_count::Int=1)::AbstractArray{Float32}
-    input = if _MODEL_HAS_SAMPLE_COUNT[]
-        Dict(
-            "input_syntax" => reshape(x, (1, size(x)...)),
-            "sample_eps" => [eps],
-            "sample_count" => [sample_count],
-        )
+function _build_fast_inference_state!(sess::ORT.InferenceSession)
+    api = sess.api
+    meminfo = sess.meminfo
+
+    # Persistent input buffers. `CreateTensorWithDataAsOrtValue` uses
+    # `pointer(data)` as the backing storage, so as long as we don't reallocate
+    # these vectors, ORT will see whatever we write to them on each `Run`.
+    input_syntax_buf = zeros(Float32, 1 * 15 * 12)            # row-major (1,15,12)
+    sample_eps_f32_buf = zeros(Float32, 1)
+    sample_eps_f64_buf = zeros(Float64, 1)
+    sample_count_buf = zeros(Int64, 1)
+
+    # Build OrtValues once. Shape vectors here are in ORT (C-row-major) order
+    # to match `vec(reversedims(arr))` from the high-level path: a Julia
+    # array of size (1,15,12) becomes shape [1,15,12] for ORT, but its
+    # contents must be laid out in row-major order — which the caller writes
+    # into `input_syntax_buf` directly (see `sample_logits`).
+    syntax_val = ORT.CAPI.CreateTensorWithDataAsOrtValue(api, meminfo, input_syntax_buf, (1, 15, 12))
+
+    eps_val, count_val = if _MODEL_HAS_SAMPLE_COUNT[]
+        ev = ORT.CAPI.CreateTensorWithDataAsOrtValue(api, meminfo, sample_eps_f64_buf, (1,))
+        cv = ORT.CAPI.CreateTensorWithDataAsOrtValue(api, meminfo, sample_count_buf, (1,))
+        ev, cv
     else
-        # Baked variant: sample_count is constant inside the graph; only pass
-        # the two real inputs. Float32 eps avoids the Float64→Float32 Cast on
-        # CPU that the legacy export forced ORT to honour.
-        Dict(
-            "input_syntax" => reshape(x, (1, size(x)...)),
-            "sample_eps" => Float32[eps],
-        )
+        ev = ORT.CAPI.CreateTensorWithDataAsOrtValue(api, meminfo, sample_eps_f32_buf, (1,))
+        ev, nothing
     end
-    return MODEL_REF[](input)["output_logits"]
+
+    input_ortvalues = count_val === nothing ? ORT.OrtValue[syntax_val, eps_val] :
+                                              ORT.OrtValue[syntax_val, eps_val, count_val]
+
+    input_name_storage = copy(sess.input_names)
+    output_name_storage = copy(sess.output_names)
+    input_name_cstrings = Cstring[Base.unsafe_convert(Cstring, s) for s in input_name_storage]
+    output_name_cstrings = Cstring[Base.unsafe_convert(Cstring, s) for s in output_name_storage]
+
+    _FAST_STATE[] = _FastInferenceState(
+        api, sess.session,
+        input_syntax_buf, sample_eps_f32_buf, sample_eps_f64_buf, sample_count_buf,
+        input_ortvalues,
+        input_name_cstrings, output_name_cstrings,
+        input_name_storage, output_name_storage,
+        Ref{Union{Nothing, ORT.OrtValue}}(nothing),
+    )
+    return nothing
+end
+
+# Direct ccall to api.Run that asks ORT to allocate the output OrtValue (we
+# pass a NULL output pointer). Returns the new output OrtValue with a
+# finalizer that releases it — which is what lets us drop the previous output
+# by simply replacing the Ref.
+function _run_with_persistent_inputs!(state::_FastInferenceState)::ORT.OrtValue
+    api = state.api
+    n_in = Csize_t(length(state.input_ortvalues))
+    n_out = Csize_t(length(state.output_name_cstrings))
+    inputs_ptrs = Ptr{Cvoid}[(v::ORT.OrtValue).ptr for v in state.input_ortvalues]
+    outputs_ptrs = Ptr{Cvoid}[C_NULL for _ in 1:n_out]
+
+    GC.@preserve state inputs_ptrs outputs_ptrs begin
+        status = @ccall $(api.Run)(
+            state.session.ptr::Ptr{Cvoid},
+            C_NULL::Ptr{Cvoid},
+            state.input_name_cstrings::Ptr{Cstring},
+            inputs_ptrs::Ptr{Ptr{Cvoid}},
+            n_in::Csize_t,
+            state.output_name_cstrings::Ptr{Cstring},
+            n_out::Csize_t,
+            outputs_ptrs::Ptr{Ptr{Cvoid}},
+        )::Ptr{Cvoid}
+        _ort_check_and_release(api, status)
+    end
+
+    # We expect exactly one output ("output_logits"); construct an OrtValue
+    # wrapper and attach a finalizer mirroring `Run` in capi.jl.
+    out = ORT.OrtValue(outputs_ptrs[1], Any[])
+    finalizer(out) do v
+        ORT.CAPI.release(api, v)
+    end
+    return out
+end
+
+function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_count::Int=1)::AbstractArray{Float32}
+    state = _FAST_STATE[]
+    @assert state !== nothing "Fast inference state not initialised — call load_model first."
+
+    # Write input_syntax into the persistent buffer in ORT row-major layout.
+    # `vec(reversedims(reshape(x, (1, ...))))` is what the high-level path
+    # used to produce; we replicate it in place. `permutedims!` writes into
+    # the destination buffer without an intermediate alloc.
+    x3d = reshape(x, (1, size(x)...))
+    permutedims!(reshape(state.input_syntax_buf, (12, 15, 1)), x3d, (3, 2, 1))
+
+    if _MODEL_HAS_SAMPLE_COUNT[]
+        state.sample_eps_f64_buf[1] = eps
+        state.sample_count_buf[1] = sample_count
+    else
+        state.sample_eps_f32_buf[1] = Float32(eps)
+        # sample_count is baked into the graph; the caller's value is implicit.
+    end
+
+    # Drop the previous batch's OrtValue *before* triggering the next Run so
+    # ORT can reuse its internal buffer pool. Safe: by contract, all `@view`
+    # slices into the previous batch were consumed before this call (see
+    # `sample_routine`).
+    state.output_ortvalue_ref[] = nothing
+
+    out = _run_with_persistent_inputs!(state)
+    state.output_ortvalue_ref[] = out
+
+    # Zero-copy view into the ORT-owned buffer. Same `PermutedDimsArray{...}`
+    # wrapper shape as the high-level `make_output` path returned, so the
+    # decode/novelty hot path doesn't change.
+    return ORT.CAPI.unsafe_GetTensorMutableData(state.api, out)
 end
 
 """
