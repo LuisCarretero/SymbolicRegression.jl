@@ -17,7 +17,11 @@ catch
     global CUDA_IMPORTED[] = false
 end
 
-export neural_mutate_tree
+export neural_mutate_tree,
+    NeuralStageTimes,
+    enable_stage_timing!,
+    reset_stage_times!,
+    get_stage_times
 
 const MODEL_REF = Ref{Union{Nothing, ORT.InferenceSession}}(nothing)
 const CFG_REF = Ref{Any}(nothing)
@@ -129,6 +133,81 @@ mutable struct NeuralMutationStats
 end
 
 const STATS_REF = Ref{NeuralMutationStats}(NeuralMutationStats())
+
+# Per-stage wall-clock accumulators for profiling. Toggled via env var so
+# regular runs are unaffected. See `enable_stage_timing!`.
+mutable struct NeuralStageTimes
+    select_subtree_ns::Int
+    encode_ns::Int
+    onnx_inference_ns::Int
+    novelty_check_ns::Int
+    decode_logits_ns::Int
+    build_tree_ns::Int
+    size_check_ns::Int
+    similarity_eval_ns::Int
+    remap_features_ns::Int
+    replace_subtree_ns::Int
+    other_ns::Int
+
+    select_subtree_calls::Int
+    encode_calls::Int
+    onnx_inference_calls::Int
+    novelty_check_calls::Int
+    decode_logits_calls::Int
+    build_tree_calls::Int
+    size_check_calls::Int
+    similarity_eval_calls::Int
+    remap_features_calls::Int
+    replace_subtree_calls::Int
+    neural_mutate_calls::Int
+
+    NeuralStageTimes() = new(
+        0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,
+    )
+end
+
+const STAGE_TIMES_REF = Ref{NeuralStageTimes}(NeuralStageTimes())
+const STAGE_TIMING_ENABLED = Ref{Bool}(false)
+const STAGE_TIMING_LOCK = ReentrantLock()
+
+enable_stage_timing!(b::Bool=true) = (STAGE_TIMING_ENABLED[] = b)
+reset_stage_times!() = (STAGE_TIMES_REF[] = NeuralStageTimes())
+get_stage_times() = STAGE_TIMES_REF[]
+
+@inline function _add_stage_ns!(field::Symbol, ns::Int)
+    STAGE_TIMING_ENABLED[] || return nothing
+    lock(STAGE_TIMING_LOCK) do
+        st = STAGE_TIMES_REF[]
+        setfield!(st, field, getfield(st, field) + ns)
+    end
+    return nothing
+end
+
+@inline function _bump_stage_call!(field::Symbol)
+    STAGE_TIMING_ENABLED[] || return nothing
+    lock(STAGE_TIMING_LOCK) do
+        st = STAGE_TIMES_REF[]
+        setfield!(st, field, getfield(st, field) + 1)
+    end
+    return nothing
+end
+
+# Macro: time a block, attribute to ns_field, increment count_field.
+# Always returns the block's value.
+macro time_stage(ns_field, count_field, expr)
+    quote
+        if STAGE_TIMING_ENABLED[]
+            local _t0 = time_ns()
+            local _v = $(esc(expr))
+            _add_stage_ns!($(QuoteNode(ns_field)), Int(time_ns() - _t0))
+            _bump_stage_call!($(QuoteNode(count_field)))
+            _v
+        else
+            $(esc(expr))
+        end
+    end
+end
 
 function add_to_stats!(stats::NeuralMutationStats, type::Symbol, with_lock::Bool, value)
     with_lock && lock(STATS_LOCK)
@@ -243,13 +322,120 @@ end
 function load_model(options::AbstractOptions)
     if options.neural_options.device == "cuda"
         if CUDA_IMPORTED[] && CUDA.functional()
-            @info "CUDA available. Loading model on GPU."    
-        else 
+            @info "CUDA available. Loading model on GPU."
+        else
             @warn "CUDA package not available. Falling back to CPU."
             options.neural_options.device = "cpu"
         end
     end
-    MODEL_REF[] = ORT.load_inference(options.neural_options.model_path, execution_provider=Symbol(options.neural_options.device))
+    # `intra_op_num_threads`/`inter_op_num_threads` left at ORT defaults (0 = library
+    # picks). T2.1 attempt (job 82414) showed pinning to 1 hurts per-call latency
+    # ~+8 % even though it removes the 41-line affinity warning storm — apparently
+    # ORT uses the intra-op pool for output staging / CPU-fallback ops introduced
+    # by the Memcpy nodes. Re-evaluate once T1.1 removes those CPU-fallback nodes.
+    MODEL_REF[] = load_inference_perf(
+        options.neural_options.model_path;
+        execution_provider=Symbol(options.neural_options.device),
+        intra_op_num_threads=0,
+        inter_op_num_threads=0,
+        graph_optimization_level=99,  # ORT_ENABLE_ALL
+    )
+    _init_model_input_contract!(MODEL_REF[])
+    if !_MODEL_HAS_SAMPLE_COUNT[]
+        @info "ONNX model uses baked sample_count contract (T1.1): sample_count not passed per call; sample_eps is Float32."
+    end
+end
+
+# ORT graph optimization levels (from onnxruntime_c_api.h GraphOptimizationLevel)
+const ORT_DISABLE_ALL = Cint(0)
+const ORT_ENABLE_BASIC = Cint(1)
+const ORT_ENABLE_EXTENDED = Cint(2)
+const ORT_ENABLE_ALL = Cint(99)
+
+"""
+    _ort_check_and_release(api, status)
+
+Wrapper around ORT status pointer: throw if non-NULL, otherwise release.
+Mirrors `ONNXRunTime.CAPI.check_and_release` (not exported).
+"""
+@inline function _ort_check_and_release(api::ORT.CAPI.OrtApi, status::Ptr{Cvoid})
+    if status != C_NULL
+        msg = unsafe_string(@ccall $(api.GetErrorMessage)(status::Ptr{Cvoid})::Cstring)
+        @ccall $(api.ReleaseStatus)(status::Ptr{Cvoid})::Cvoid
+        throw(ORT.CAPI.OrtException(msg))
+    end
+    return nothing
+end
+
+@inline function _set_intra_op_num_threads!(api::ORT.CAPI.OrtApi, opts::ORT.CAPI.OrtSessionOptions, n::Integer)
+    status = @ccall $(api.SetIntraOpNumThreads)(opts.ptr::Ptr{Cvoid}, Cint(n)::Cint)::Ptr{Cvoid}
+    _ort_check_and_release(api, status)
+end
+
+@inline function _set_inter_op_num_threads!(api::ORT.CAPI.OrtApi, opts::ORT.CAPI.OrtSessionOptions, n::Integer)
+    status = @ccall $(api.SetInterOpNumThreads)(opts.ptr::Ptr{Cvoid}, Cint(n)::Cint)::Ptr{Cvoid}
+    _ort_check_and_release(api, status)
+end
+
+@inline function _set_graph_optimization_level!(api::ORT.CAPI.OrtApi, opts::ORT.CAPI.OrtSessionOptions, level::Integer)
+    status = @ccall $(api.SetSessionGraphOptimizationLevel)(opts.ptr::Ptr{Cvoid}, Cint(level)::Cint)::Ptr{Cvoid}
+    _ort_check_and_release(api, status)
+end
+
+"""
+    load_inference_perf(path; ...)
+
+Drop-in replacement for `ORT.load_inference` that sets a few performance-relevant
+session options before `CreateSession`:
+
+- `intra_op_num_threads`: cap intra-op thread pool (0 = ORT default, the value we
+  ship with — pinning to 1 was tried in job 82414 and was inconclusive within
+  noise; revisit once T1.1 removes the CPU-fallback Memcpy nodes that the pool
+  serves).
+- `inter_op_num_threads`: cap inter-op thread pool (0 = ORT default).
+- `graph_optimization_level`: 0/1/2/99 (default 99 = `ORT_ENABLE_ALL`).
+
+ONNXRunTime.jl's high-level `load_inference` does not expose these (T2.1 / T2.3
+in `src/perf_experiments/IDEAS.md`), so we duplicate the body here, calling the
+already-loaded function pointers in `OrtApi` directly via ccall.
+"""
+function load_inference_perf(
+    path::AbstractString;
+    execution_provider::Symbol=:cpu,
+    envname::AbstractString="defaultenv",
+    intra_op_num_threads::Int=0,
+    inter_op_num_threads::Int=0,
+    graph_optimization_level::Int=Int(ORT_ENABLE_ALL),
+)::ORT.InferenceSession
+    api = ORT.CAPI.GetApi(; execution_provider)
+    env = ORT.CAPI.CreateEnv(api; name=envname, logging_level=ORT.CAPI.ORT_LOGGING_LEVEL_WARNING)
+    session_options = ORT.CAPI.CreateSessionOptions(api)
+
+    # 0 means "leave at ORT default". Only call the setters with positive values.
+    intra_op_num_threads > 0 && _set_intra_op_num_threads!(api, session_options, intra_op_num_threads)
+    inter_op_num_threads > 0 && _set_inter_op_num_threads!(api, session_options, inter_op_num_threads)
+    _set_graph_optimization_level!(api, session_options, graph_optimization_level)
+
+    if execution_provider === :cuda
+        cuda_options = ORT.CAPI.OrtCUDAProviderOptions()
+        ORT.CAPI.SessionOptionsAppendExecutionProvider_CUDA(api, session_options, cuda_options)
+    elseif execution_provider !== :cpu
+        error("Unsupported execution_provider $execution_provider")
+    end
+
+    session = ORT.CAPI.CreateSession(api, env, path, session_options)
+    meminfo = ORT.CAPI.CreateCpuMemoryInfo(api)
+    allocator = ORT.CAPI.CreateAllocator(api, session, meminfo)
+
+    # Mirror ONNXRunTime.input_names/output_names (private helpers).
+    n_in = ORT.CAPI.SessionGetInputCount(api, session)
+    n_out = ORT.CAPI.SessionGetOutputCount(api, session)
+    in_names = String[ORT.CAPI.SessionGetInputName(api, session, Csize_t(i), allocator) for i in 0:n_in-1]
+    out_names = String[ORT.CAPI.SessionGetOutputName(api, session, Csize_t(i), allocator) for i in 0:n_out-1]
+    @assert allunique(in_names)
+    @assert allunique(out_names)
+
+    return ORT.InferenceSession(api, execution_provider, session, meminfo, allocator, in_names, out_names)
 end
 
 """
@@ -257,16 +443,46 @@ end
 
 Sample the logits of the neural network.
 Currently assuming single sample as input and then sample_count samples as output.
+
+Two ONNX graph contracts are supported:
+
+  * legacy 3-input: `input_syntax`, `sample_eps` (Float64 [1]), `sample_count` (Int64 [1])
+  * baked 2-input: `input_syntax`, `sample_eps` (Float32 [1]) — sample_count is
+    constant-folded into the graph (T1.1, removes CPU-fallback Memcpy nodes).
+    The caller's `sample_count` is then implicit; mismatch is an error.
+
+The variant is detected once at session-load time from `MODEL_REF[].input_names`
+(see `_init_model_input_contract!`), so the per-call cost is just a single Bool
+check — no string lookup.
 """
+const _MODEL_HAS_SAMPLE_COUNT = Ref{Bool}(true)
+
+function _init_model_input_contract!(sess::ORT.InferenceSession)
+    _MODEL_HAS_SAMPLE_COUNT[] = "sample_count" in sess.input_names
+    # `sample_eps` element type is implied by the contract (legacy=Float64,
+    # baked=Float32); we don't introspect ONNX tensor element types because
+    # the high-level ONNXRunTime.jl API doesn't expose them and the input
+    # name alone is enough.
+    return nothing
+end
+
 function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_count::Int=1)::AbstractArray{Float32}
-    input = Dict(
-        "input_syntax" => reshape(x, (1, size(x)...)), 
-        "sample_eps" => [eps], 
-        "sample_count" => [sample_count]
-    )
-    raw_out = MODEL_REF[](input)
-    x_out = raw_out["output_logits"]
-    return x_out
+    input = if _MODEL_HAS_SAMPLE_COUNT[]
+        Dict(
+            "input_syntax" => reshape(x, (1, size(x)...)),
+            "sample_eps" => [eps],
+            "sample_count" => [sample_count],
+        )
+    else
+        # Baked variant: sample_count is constant inside the graph; only pass
+        # the two real inputs. Float32 eps avoids the Float64→Float32 Cast on
+        # CPU that the legacy export forced ORT to honour.
+        Dict(
+            "input_syntax" => reshape(x, (1, size(x)...)),
+            "sample_eps" => Float32[eps],
+        )
+    end
+    return MODEL_REF[](input)["output_logits"]
 end
 
 """
@@ -307,15 +523,19 @@ function neural_mutate_tree(
     rng::AbstractRNG=default_rng()
 ) where {T}
     OPTIONS_REF[] !== options && setup_module(options)
-    
+
     increment_stats!(STATS_REF[], :total_attempts, true)
+    _bump_stage_call!(:neural_mutate_calls)
     if !ENABLED_REF[]
         increment_stats!(STATS_REF[], :module_not_enabled, true)
         return tree
     end
 
     # Select a viable subtree to mutate FIXME: Could also try different tree if this one isn't successfull
-    found_subtree, subtree, parent, feature_set = select_viable_subtree(tree, options)
+    found_subtree, subtree, parent, feature_set = @time_stage(
+        select_subtree_ns, select_subtree_calls,
+        select_viable_subtree(tree, options),
+    )
     if !found_subtree
         increment_stats!(STATS_REF[], :no_subtree_found, true)
         return tree
@@ -342,7 +562,10 @@ function neural_mutate_tree(
     end
     
     # Replace the old subtree with the new one
-    return replace_subtree(tree, parent, subtree, new_subtree)
+    return @time_stage(
+        replace_subtree_ns, replace_subtree_calls,
+        replace_subtree(tree, parent, subtree, new_subtree),
+    )
 end
 
 """
@@ -366,10 +589,16 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
     original_feature = length(feature_set) > 0 ? first(feature_set) : 1
 
     # Remap original subtree to x1 for evaluation (no-op if already x1)
-    subtree_x1 = remap_features(subtree, original_feature, 1)
+    subtree_x1 = @time_stage(
+        remap_features_ns, remap_features_calls,
+        remap_features(subtree, original_feature, 1),
+    )
 
     # Encode the subtree into a one-hot vector (structure only, feature doesn't affect encoding)
-    encode_success, x_in = node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[])
+    encode_success, x_in = @time_stage(
+        encode_ns, encode_calls,
+        node_to_onehot(subtree, CFG_REF[], OP_TO_LOGITS_REF[]),
+    )
     if !encode_success
         increment_stats!(STATS_REF[], :encoding_failures, true)
         return false, subtree, Inf
@@ -377,33 +606,48 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
 
     for attempt in 1:(options.neural_options.max_resamples+1)
         increment_stats!(STATS_REF[], :total_samples, true)
-        
-        # Grab new output  TODO: Make this an object or somehow outsource current_sample_idx 
+
+        # Grab new output  TODO: Make this an object or somehow outsource current_sample_idx
         if current_sample_idx >= options.neural_options.sample_batchsize  # Used last sample from batch: Resample.
-            x_out_batch = sample_logits(x_in, options.neural_options.sampling_eps, options.neural_options.sample_batchsize)
+            x_out_batch = @time_stage(
+                onnx_inference_ns, onnx_inference_calls,
+                sample_logits(x_in, options.neural_options.sampling_eps, options.neural_options.sample_batchsize),
+            )
             current_sample_idx = 1
         else  # Still have samples left in batch: Use these.
             current_sample_idx += 1
         end
         x_out = x_out_batch[current_sample_idx, :, :]
 
-        if options.neural_options.require_novel_skeleton && !check_novel_skeleton(x_in, x_out, options)
-            increment_stats!(STATS_REF[], :skeleton_not_novel, true)
-            continue
+        if options.neural_options.require_novel_skeleton
+            novel = @time_stage(
+                novelty_check_ns, novelty_check_calls,
+                check_novel_skeleton(x_in, x_out, options),
+            )
+            if !novel
+                increment_stats!(STATS_REF[], :skeleton_not_novel, true)
+                continue
+            end
         end
 
-        success, prods = logits_to_prods(x_out, options.neural_options.sample_logits)
+        success, prods = @time_stage(
+            decode_logits_ns, decode_logits_calls,
+            logits_to_prods(x_out, options.neural_options.sample_logits),
+        )
         if !success
             increment_stats!(STATS_REF[], :decoding_failures, true)
             continue
         end
-        
+
         # Sampling model is implicitly univariate and returns only x1 as features after decoding via `logits_to_prods`
         feature_cnt_new = count(p -> p[2] == "'x1'", prods)
 
         if options.neural_options.subtree_max_features == 1  # Univariate decoding
             # Always generate with feature 1 for evaluation
-            success, new_subtree_x1 = prods_to_tree(prods, OP_INDEX_REF[], fill(1, feature_cnt_new), T)
+            success, new_subtree_x1 = @time_stage(
+                build_tree_ns, build_tree_calls,
+                prods_to_tree(prods, OP_INDEX_REF[], fill(1, feature_cnt_new), T),
+            )
 
             if !success
                 increment_stats!(STATS_REF[], :tree_build_failures, true)
@@ -411,7 +655,10 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
             end
 
             if options.neural_options.require_tree_size_similarity
-                good = verify_tree_size_similar(subtree, new_subtree_x1, options)
+                good = @time_stage(
+                    size_check_ns, size_check_calls,
+                    verify_tree_size_similar(subtree, new_subtree_x1, options),
+                )
                 if !good
                     increment_stats!(STATS_REF[], :tree_comparison_failures, true)
                     continue
@@ -420,12 +667,18 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
 
             if options.neural_options.require_expr_similarity
                 # Compare both using x1 (matches EVAL_X_UNIVARIATE_REF dimensions)
-                is_similar, mse = check_expr_similarity(subtree_x1, new_subtree_x1, options, feature_cnt_new)
+                is_similar, mse = @time_stage(
+                    similarity_eval_ns, similarity_eval_calls,
+                    check_expr_similarity(subtree_x1, new_subtree_x1, options, feature_cnt_new),
+                )
 
                 if is_similar
                     increment_stats!(STATS_REF[], :returned_similar_exprs, true)
                     # Remap back to original feature before returning
-                    new_subtree = remap_features(new_subtree_x1, 1, original_feature)
+                    new_subtree = @time_stage(
+                        remap_features_ns, remap_features_calls,
+                        remap_features(new_subtree_x1, 1, original_feature),
+                    )
                     return true, new_subtree, mse
                 else
                     increment_stats!(STATS_REF[], :expr_similarity_failures, true)
@@ -434,7 +687,10 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
                 end
             else
                 # No similarity requirement - remap and return immediately
-                new_subtree = remap_features(new_subtree_x1, 1, original_feature)
+                new_subtree = @time_stage(
+                    remap_features_ns, remap_features_calls,
+                    remap_features(new_subtree_x1, 1, original_feature),
+                )
                 return true, new_subtree, Inf
             end
 
@@ -478,7 +734,10 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
 
         if options.neural_options.subtree_max_features == 1
             # Univariate candidates stored with x1 - remap back to original feature
-            new_subtree = remap_features(candidate_subtree, 1, original_feature)
+            new_subtree = @time_stage(
+                remap_features_ns, remap_features_calls,
+                remap_features(candidate_subtree, 1, original_feature),
+            )
         else
             # Multivariate candidates already have correct features
             new_subtree = candidate_subtree
