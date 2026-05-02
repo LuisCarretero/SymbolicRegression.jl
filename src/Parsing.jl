@@ -267,7 +267,7 @@ Uses the precomputed `GRAMMAR_RULES` table to look up parsed rule metadata
 splits that previously dominated this function.
 """
 function logits_to_prods(
-    logits::Matrix{Float32},
+    logits::AbstractMatrix{Float32},
     sample::Bool=false,
     max_length::Int=15
 )::Tuple{Bool, Union{Vector{Tuple{String, String}}, Nothing}}

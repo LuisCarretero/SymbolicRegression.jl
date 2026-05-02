@@ -635,7 +635,9 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
         else  # Still have samples left in batch: Use these.
             current_sample_idx += 1
         end
-        x_out = x_out_batch[current_sample_idx, :, :]
+        # `view` (not a copy) — `logits_to_prods` and `check_novel_skeleton`
+        # only read from this slice, never mutate it.
+        x_out = @view x_out_batch[current_sample_idx, :, :]
 
         if options.neural_options.require_novel_skeleton
             novel = @time_stage(
@@ -919,14 +921,16 @@ Check if the skeleton of the new subtree is novel.
     FIXME: Not quite correct as logits -> tree is probabilistic and samples from token distribution. Distributions usually have low
     entropy though so this is probably good enough.
 """
-function check_novel_skeleton(x_in::Matrix{Float32}, x_out::Matrix{Float32}, options::AbstractOptions)
-    # Only check onehot logits, not constants vector
-    x_in_onehot = x_in[:, 1:end-1]  # Remove constants column
-    x_out_onehot = x_out[:, 1:end-1]
-    
-    for i in axes(x_in_onehot, 1)  # Iterate over rows
-        in_max = argmax(x_in_onehot[i, :])
-        out_max = argmax(x_out_onehot[i, :])
+function check_novel_skeleton(x_in::AbstractMatrix{Float32}, x_out::AbstractMatrix{Float32}, options::AbstractOptions)
+    # Compare argmax-per-row over the one-hot columns (skip the trailing
+    # constants column). No materialization of intermediate slices: walk both
+    # rows in lockstep with `@views` so we work directly on the underlying
+    # buffer (`x_out` is typically a `view` into the per-batch output).
+    n_rows = size(x_in, 1)
+    n_cols_onehot = size(x_in, 2) - 1
+    @inbounds for i in 1:n_rows
+        in_max = argmax(@view x_in[i, 1:n_cols_onehot])
+        out_max = argmax(@view x_out[i, 1:n_cols_onehot])
         if in_max != out_max
             return true
         end
