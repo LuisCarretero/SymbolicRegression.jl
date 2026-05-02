@@ -604,6 +604,24 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
         return false, subtree, Inf
     end
 
+    # Evaluate the *original* subtree ONCE, outside the resampling loop, when
+    # similarity evaluation is needed. The original tree doesn't change across
+    # resamples, so per-attempt re-evaluation is pure waste. (Univariate path
+    # only — multivariate uses a different X per `multivariate_decoding`
+    # iteration and stays on the legacy `check_expr_similarity`.)
+    orig_eval_X, orig_eval_res = nothing, nothing
+    if options.neural_options.subtree_max_features == 1 && options.neural_options.require_expr_similarity
+        ok_orig, X_orig, res_orig = @time_stage(
+            similarity_eval_ns, similarity_eval_calls,
+            _eval_orig_subtree(subtree_x1, options, 1),
+        )
+        if !ok_orig
+            return false, subtree, Inf
+        end
+        orig_eval_X = X_orig
+        orig_eval_res = res_orig
+    end
+
     for attempt in 1:(options.neural_options.max_resamples+1)
         increment_stats!(STATS_REF[], :total_samples, true)
 
@@ -666,10 +684,13 @@ function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int
             end
 
             if options.neural_options.require_expr_similarity
-                # Compare both using x1 (matches EVAL_X_UNIVARIATE_REF dimensions)
+                # Compare both using x1 (matches EVAL_X_UNIVARIATE_REF dimensions).
+                # Reuse the once-per-routine cached evaluation of the original
+                # subtree (see `_eval_orig_subtree` above) instead of redoing
+                # `eval_tree_array(subtree_x1, X, ...)` on every attempt.
                 is_similar, mse = @time_stage(
                     similarity_eval_ns, similarity_eval_calls,
-                    check_expr_similarity(subtree_x1, new_subtree_x1, options, feature_cnt_new),
+                    _check_expr_similarity_with_orig(new_subtree_x1, orig_eval_X, orig_eval_res, options),
                 )
 
                 if is_similar
@@ -804,36 +825,76 @@ function get_all_feature_combinations(feature_set::Set{Int}, feature_cnt::Int)
     end
 end
 
+"""
+    _eval_orig_subtree(subtree, options, feature_cnt) -> (success, X, res_orig)
+
+Evaluate the *original* subtree once per `sample_routine` call (not per
+resampling attempt). The original subtree never changes inside the loop, so
+re-evaluating it on every `check_expr_similarity` call is pure waste —
+`similarity_eval` was the second-largest stage cost (~10 % of neural wall) in
+job 82421 (post-decoder rewrite).
+
+Returns `(true, X, res_orig)` on success or `(false, X, res_orig)` if the orig
+eval fails or produces non-finite values (in which case the rest of the
+sample routine should bail out — there's no point trying alternatives if the
+original tree itself is broken).
+"""
+function _eval_orig_subtree(
+    subtree::AbstractExpressionNode{T},
+    options::AbstractOptions,
+    feature_cnt::Int=1
+)::Tuple{Bool, Matrix{T}, Vector{T}} where {T}
+    X = if feature_cnt == 1
+        Matrix{T}(EVAL_X_UNIVARIATE_REF[])
+    else
+        points_cnt = options.neural_options.eval_npoints * feature_cnt^2
+        Matrix{T}(rand(Uniform(T(options.neural_options.eval_min),
+                               T(options.neural_options.eval_max)),
+                       feature_cnt, points_cnt))
+    end
+    try
+        (res, complete) = eval_tree_array(subtree, X, options.operators)
+        if !complete || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(T)) || x <= nextfloat(typemin(T)), res)
+            increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
+            return false, X, T[]
+        end
+        return true, X, res
+    catch e
+        increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
+        return false, X, T[]
+    end
+end
+
 function check_expr_similarity(
     subtree::AbstractExpressionNode{T},
     new_subtree::AbstractExpressionNode{T},
     options::AbstractOptions,
     feature_cnt::Int=1
 )::Tuple{Bool, Float32} where {T}
-    if feature_cnt == 1
-        # Use pre-computed univariate X
-        X = Matrix{T}(EVAL_X_UNIVARIATE_REF[])
-    elseif feature_cnt > 1
-        points_cnt = options.neural_options.eval_npoints * feature_cnt^2  # Is this a good scaling?
-        X = Matrix{T}(rand(Uniform(T(options.neural_options.eval_min), T(options.neural_options.eval_max)), feature_cnt, points_cnt))
-    end
-    
-    res = nothing
+    # Backwards-compatible path: evaluate orig + new ourselves. Used only by
+    # `multivariate_decoding`, which builds X with random points each call so
+    # the orig eval really *does* depend on the iteration. Hot path
+    # (`sample_routine` univariate) calls the cached overload below instead.
+    success, X, res = _eval_orig_subtree(subtree, options, feature_cnt)
+    success || return false, Inf
+    return _check_expr_similarity_with_orig(new_subtree, X, res, options)
+end
+
+"""
+    _check_expr_similarity_with_orig(new_subtree, X, res_orig, options) -> (is_similar, mse)
+
+Cached-orig variant of `check_expr_similarity`: caller provides the already-
+evaluated `res_orig` for the original subtree on `X`, so we only evaluate the
+candidate `new_subtree` here. Used by the resampling loop in `sample_routine`
+where the original subtree is fixed across attempts.
+"""
+function _check_expr_similarity_with_orig(
+    new_subtree::AbstractExpressionNode{T},
+    X::Matrix{T},
+    res::Vector{T},
+    options::AbstractOptions,
+)::Tuple{Bool, Float32} where {T}
     res_new = nothing
-    
-    # Evaluate (old) subtree
-    try
-        (res, complete) = eval_tree_array(subtree, X, options.operators)
-        if !complete || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(T)) || x <= nextfloat(typemin(T)), res)
-            increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
-            return false, Inf
-        end
-    catch e
-        increment_stats!(STATS_REF[], :orig_tree_eval_failures, true)
-        return false, Inf
-    end
-    
-    # Evaluate new subtree
     try
         (res_new, complete_new) = eval_tree_array(new_subtree, X, options.operators)
         if !complete_new || any(x -> isnan(x) || isinf(x) || x >= prevfloat(typemax(T)) || x <= nextfloat(typemin(T)), res_new)
@@ -845,9 +906,8 @@ function check_expr_similarity(
         return false, Inf
     end
 
-    # Calculate MSE with configured transform
     transform = EVAL_TRANSFORM_REF[]
-    mse_T = sum((transform.(res) .- transform.(res_new)).^2) / size(X)[2]
+    mse_T = sum((transform.(res) .- transform.(res_new)).^2) / size(X, 2)
     mse = Float32(mse_T)
     return mse < options.neural_options.similarity_threshold, mse
 end
