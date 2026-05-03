@@ -532,17 +532,20 @@ function select_viable_subtree(
     tree::Node{T}, 
     options::AbstractOptions
 )::Tuple{Bool, Union{Node{T}, Nothing}, Union{Node{T}, Nothing}, Union{Set{Int}, Nothing}} where T<:Number
-    # Store descendant count and feature set for each node
-    desc_counts = Dict{Node{T}, Int}() 
-    feature_sets = Dict{Node{T}, Set{Int}}()
-    
-    # Helper function to compute descendants recursively
-    function count_descendants(node::Node{T})::Tuple{Int,Set{Int}}
+    # Per-node bookkeeping. IdDict (pointer hash) avoids structural equality
+    # walks on Node keys. Feature sets stored as BitSet (Vector{UInt64} bitmap)
+    # rather than Set{Int} (Dict-backed): denser, faster `union!`, one alloc
+    # per node instead of a Dict realloc dance. Feature space is the input
+    # variable count — small and dense, ideal for a bitmap.
+    desc_counts = IdDict{Node{T}, Int}()
+    feature_sets = IdDict{Node{T}, BitSet}()
+
+    function count_descendants(node::Node{T})::Tuple{Int,BitSet}
         if haskey(desc_counts, node)
             return desc_counts[node], feature_sets[node]
         end
-        
-        features = Set{Int}()
+
+        features = BitSet()
         if node.degree == 0
             if !node.constant
                 push!(features, node.feature)
@@ -551,51 +554,51 @@ function select_viable_subtree(
             feature_sets[node] = features
             return 1, features
         end
-        
+
         left_count, left_features = count_descendants(node.l)
         right_count = 0
-        right_features = Set{Int}()
+        right_features = BitSet()
         if node.degree == 2
             right_count, right_features = count_descendants(node.r)
         end
-        
+
         total = 1 + left_count + right_count
         union!(features, left_features, right_features)
-        
+
         desc_counts[node] = total
         feature_sets[node] = features
         return total, features
     end
-    
-    # Compute descendants for whole tree
+
     count_descendants(tree)
-    
-    # Find valid subtrees
-    valid_subtrees = []
+
+    # Find valid subtrees. Store BitSet internally; convert the chosen one to
+    # Set{Int} at the return boundary to preserve the existing API.
+    valid_subtrees = Tuple{Node{T}, Union{Node{T}, Nothing}, BitSet}[]
+    sizehint!(valid_subtrees, length(desc_counts))
     function check_node(node::Node{T}, parent::Union{Node{T},Nothing})
         count = desc_counts[node]
         features = feature_sets[node]
-        
+
         if options.neural_options.subtree_min_nodes <= count <= options.neural_options.subtree_max_nodes &&
             length(features) <= options.neural_options.subtree_max_features
             push!(valid_subtrees, (node, parent, features))
         end
-        
+
         if node.degree >= 1
             check_node(node.l, node)
             if node.degree == 2
-                check_node(node.r, node) 
+                check_node(node.r, node)
             end
         end
     end
-    
+
     check_node(tree, nothing)
-    
+
     isempty(valid_subtrees) && return (false, tree, nothing, Set{Int}())
-    
-    # Randomly select one valid subtree
+
     selected = rand(valid_subtrees)
-    return (true, selected[1], selected[2], selected[3])
+    return (true, selected[1], selected[2], Set{Int}(selected[3]))
 end
 
 function count_nodes(tree::Node)::Int
