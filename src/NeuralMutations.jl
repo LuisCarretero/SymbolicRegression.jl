@@ -148,6 +148,13 @@ mutable struct NeuralStageTimes
     remap_features_ns::Int
     replace_subtree_ns::Int
     other_ns::Int
+    # Catch-all timers: neural_mutate_total wraps the entire body of
+    # `neural_mutate_tree`; sample_routine_total wraps the `sample_routine`
+    # call. Diff against the sum of named stages localises any unaccounted
+    # neural-only time.
+    neural_mutate_total_ns::Int
+    sample_routine_total_ns::Int
+    stats_lock_ns::Int
 
     select_subtree_calls::Int
     encode_calls::Int
@@ -160,10 +167,12 @@ mutable struct NeuralStageTimes
     remap_features_calls::Int
     replace_subtree_calls::Int
     neural_mutate_calls::Int
+    sample_routine_calls::Int
+    stats_lock_calls::Int
 
     NeuralStageTimes() = new(
-        0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0, 0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0, 0,0,
     )
 end
 
@@ -790,6 +799,8 @@ function neural_mutate_tree(
         return tree
     end
 
+    local _t_total = STAGE_TIMING_ENABLED[] ? time_ns() : UInt64(0)
+
     # Select a viable subtree to mutate FIXME: Could also try different tree if this one isn't successfull
     found_subtree, subtree, parent, feature_set = @time_stage(
         select_subtree_ns, select_subtree_calls,
@@ -797,15 +808,21 @@ function neural_mutate_tree(
     )
     if !found_subtree
         increment_stats!(STATS_REF[], :no_subtree_found, true)
+        STAGE_TIMING_ENABLED[] && _add_stage_ns!(:neural_mutate_total_ns, Int(time_ns() - _t_total))
         return tree
     end
 
-    success, new_subtree, mse = sample_routine(subtree, feature_set, options)
+    success, new_subtree, mse = @time_stage(
+        sample_routine_total_ns, sample_routine_calls,
+        sample_routine(subtree, feature_set, options),
+    )
     if !success
         increment_stats!(STATS_REF[], :sample_routine_failures, true)
+        STAGE_TIMING_ENABLED[] && _add_stage_ns!(:neural_mutate_total_ns, Int(time_ns() - _t_total))
         return tree
     end
 
+    @time_stage(stats_lock_ns, stats_lock_calls,
     lock(STATS_LOCK) do
         add_to_stats!(STATS_REF[], :total_tree_sizes, false, count_nodes(tree))
         add_to_stats!(STATS_REF[], :subtree_in_sizes, false, count_nodes(subtree))
@@ -818,13 +835,15 @@ function neural_mutate_tree(
             add_to_stats!(STATS_REF[], :new_subtree_string, false, string_tree(new_subtree, options))
         end
         increment_stats!(STATS_REF[], :successful_mutations, false)
-    end
-    
+    end)
+
     # Replace the old subtree with the new one
-    return @time_stage(
+    local _result = @time_stage(
         replace_subtree_ns, replace_subtree_calls,
         replace_subtree(tree, parent, subtree, new_subtree),
     )
+    STAGE_TIMING_ENABLED[] && _add_stage_ns!(:neural_mutate_total_ns, Int(time_ns() - _t_total))
+    return _result
 end
 
 """
@@ -839,8 +858,10 @@ Note that subtree may be multivariate but node_to_onehot replaces all features w
 """
 function sample_routine(subtree::AbstractExpressionNode{T}, feature_set::Set{Int}, options::AbstractOptions)::Tuple{Bool, Union{AbstractExpressionNode{T}, Nothing}, Float64} where {T}
 
-    # Keep track of candidates that pass all checks except similarity
+    # Keep track of candidates that pass all checks except similarity. Pre-size
+    # so the resampling loop never grows-and-copies the buffer.
     candidates = Vector{Tuple{AbstractExpressionNode{T}, Float64}}()
+    sizehint!(candidates, options.neural_options.max_resamples + 1)
     current_sample_idx = Inf
     x_out_batch = nothing
 
