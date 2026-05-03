@@ -368,42 +368,28 @@ function logits_to_prods(
 end
 
 function is_tree_valid(tree::AbstractExpressionNode{T})::Bool where {T}
+    # The outer try/catch is the only exception barrier we need: any property
+    # access on a partially-constructed Node throws (`UndefRefError`/`BoundsError`/
+    # etc.) and lands here. Inner try/catches around `tree.constant`/`tree.feature`/
+    # `tree.op` were redundant with this one — same behaviour, fewer try frames
+    # per recursive call.
     try
-        # Basic structure checks
-        tree === nothing && return false
-        
-        # Check if we can access basic properties without crashing
         degree = tree.degree
         (degree < 0 || degree > 2) && return false
-        
-        # Check children based on degree
+
         if degree >= 1
             tree.l === nothing && return false
             !is_tree_valid(tree.l) && return false
-        end
-        if degree == 2
-            tree.r === nothing && return false
-            !is_tree_valid(tree.r) && return false
-        end
-        
-        # Check if we can access other properties
-        if degree == 0
-            # For leaf nodes, check if we can access the value/feature
-            try
-                _ = tree.constant
-                _ = tree.feature
-            catch
-                return false
+            if degree == 2
+                tree.r === nothing && return false
+                !is_tree_valid(tree.r) && return false
             end
+            _ = tree.op
         else
-            # For operator nodes, check if we can access the operator
-            try
-                _ = tree.op
-            catch
-                return false
-            end
+            _ = tree.constant
+            _ = tree.feature
         end
-        
+
         return true
     catch
         return false
