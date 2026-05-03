@@ -320,12 +320,14 @@ function setup_module(options::AbstractOptions)
 end
 
 function load_model(options::AbstractOptions)
-    if options.neural_options.device == "cuda"
+    device_str = options.neural_options.device
+    if device_str == "cuda" || device_str == "tensorrt"
         if CUDA_IMPORTED[] && CUDA.functional()
-            @info "CUDA available. Loading model on GPU."
+            @info "CUDA available. Loading model on GPU ($(device_str))."
         else
             @warn "CUDA package not available. Falling back to CPU."
             options.neural_options.device = "cpu"
+            device_str = "cpu"
         end
     end
     # `intra_op_num_threads`/`inter_op_num_threads` left at ORT defaults (0 = library
@@ -333,16 +335,36 @@ function load_model(options::AbstractOptions)
     # ~+8 % even though it removes the 41-line affinity warning storm — apparently
     # ORT uses the intra-op pool for output staging / CPU-fallback ops introduced
     # by the Memcpy nodes. Re-evaluate once T1.1 removes those CPU-fallback nodes.
+    #
+    # TensorRT EP: opt in via `device="tensorrt"`. The first session-load
+    # JIT-compiles a TRT engine (slow); we cache it in a per-model
+    # directory next to the .onnx file so subsequent loads are instant.
+    # Pick up an optional SR_TRT_FP16=1 env var to flip TRT to fp16
+    # internally — no re-export needed (TRT casts the fp32 weights at
+    # engine-build time).
+    trt_cache_path = if device_str == "tensorrt"
+        cache_dir = joinpath(dirname(options.neural_options.model_path), "trt_cache")
+        mkpath(cache_dir)
+        cache_dir
+    else
+        nothing
+    end
+    trt_fp16 = device_str == "tensorrt" && get(ENV, "SR_TRT_FP16", "0") == "1"
     MODEL_REF[] = load_inference_perf(
         options.neural_options.model_path;
-        execution_provider=Symbol(options.neural_options.device),
+        execution_provider=Symbol(device_str),
         intra_op_num_threads=0,
         inter_op_num_threads=0,
         graph_optimization_level=99,  # ORT_ENABLE_ALL
+        trt_fp16=trt_fp16,
+        trt_engine_cache_path=trt_cache_path,
     )
     _init_model_input_contract!(MODEL_REF[])
     if !_MODEL_HAS_SAMPLE_COUNT[]
         @info "ONNX model uses baked sample_count contract (T1.1): sample_count not passed per call; sample_eps is Float32."
+    end
+    if device_str == "tensorrt"
+        @info "TensorRT EP enabled (fp16=$(trt_fp16); engine_cache=$(trt_cache_path)). First call will build the engine."
     end
     _build_fast_inference_state!(MODEL_REF[])
 end
@@ -383,6 +405,81 @@ end
     _ort_check_and_release(api, status)
 end
 
+# OrtTensorRTProviderOptions (V1) — mirrors onnxruntime_c_api.h. Field order
+# and types match the C struct exactly; passing the Julia struct by-Ref to
+# the ccall hands ORT a pointer to compatible memory. Pointer fields
+# (calibration table name, cache path, decryption lib path) are C_NULL when
+# unused.
+struct _OrtTensorRTProviderOptionsV1
+    device_id::Cint
+    has_user_compute_stream::Cint
+    user_compute_stream::Ptr{Cvoid}
+    trt_max_partition_iterations::Cint
+    trt_min_subgraph_size::Cint
+    trt_max_workspace_size::Csize_t
+    trt_fp16_enable::Cint
+    trt_int8_enable::Cint
+    trt_int8_calibration_table_name::Ptr{UInt8}
+    trt_int8_use_native_calibration_table::Cint
+    trt_dla_enable::Cint
+    trt_dla_core::Cint
+    trt_dump_subgraphs::Cint
+    trt_engine_cache_enable::Cint
+    trt_engine_cache_path::Ptr{UInt8}
+    trt_engine_decryption_enable::Cint
+    trt_engine_decryption_lib_path::Ptr{UInt8}
+    trt_force_sequential_engine_build::Cint
+end
+
+# `gchandle` keeps Julia-owned strings alive as long as the caller wants
+# the options to be valid (ORT copies the path internally during
+# SessionOptionsAppendExecutionProvider_TensorRT, so in practice the
+# gchandle only needs to outlive that single ccall).
+function _make_trt_options(;
+    device_id::Int=0,
+    fp16::Bool=false,
+    max_workspace_size::Int=1 << 30,           # 1 GiB
+    engine_cache_enable::Bool=true,
+    engine_cache_path::Union{Nothing, String}=nothing,
+)::Tuple{_OrtTensorRTProviderOptionsV1, Vector{Any}}
+    gchandle = Any[]
+    cache_ptr = if engine_cache_path === nothing
+        Ptr{UInt8}(C_NULL)
+    else
+        push!(gchandle, engine_cache_path)
+        Ptr{UInt8}(Base.unsafe_convert(Cstring, engine_cache_path))
+    end
+    opts = _OrtTensorRTProviderOptionsV1(
+        Cint(device_id),
+        Cint(0), C_NULL,
+        Cint(1000),                                    # max_partition_iterations (ORT default)
+        Cint(1),                                       # min_subgraph_size (ORT default)
+        Csize_t(max_workspace_size),
+        Cint(fp16 ? 1 : 0), Cint(0),                   # fp16, int8
+        Ptr{UInt8}(C_NULL), Cint(0),                   # int8 calibration
+        Cint(0), Cint(0), Cint(0),                     # DLA, dump_subgraphs
+        Cint(engine_cache_enable ? 1 : 0), cache_ptr,
+        Cint(0), Ptr{UInt8}(C_NULL),                   # decryption
+        Cint(0),                                       # force_sequential_engine_build
+    )
+    return opts, gchandle
+end
+
+@inline function _append_tensorrt_provider!(
+    api::ORT.CAPI.OrtApi,
+    opts::ORT.CAPI.OrtSessionOptions,
+    trt_opts::_OrtTensorRTProviderOptionsV1,
+)
+    trt_ref = Ref(trt_opts)
+    status = GC.@preserve trt_ref begin
+        @ccall $(api.SessionOptionsAppendExecutionProvider_TensorRT)(
+            opts.ptr::Ptr{Cvoid},
+            trt_ref::Ptr{Cvoid},
+        )::Ptr{Cvoid}
+    end
+    _ort_check_and_release(api, status)
+end
+
 """
     load_inference_perf(path; ...)
 
@@ -407,8 +504,18 @@ function load_inference_perf(
     intra_op_num_threads::Int=0,
     inter_op_num_threads::Int=0,
     graph_optimization_level::Int=Int(ORT_ENABLE_ALL),
+    trt_fp16::Bool=false,
+    trt_engine_cache_path::Union{Nothing, String}=nothing,
 )::ORT.InferenceSession
-    api = ORT.CAPI.GetApi(; execution_provider)
+    # The :tensorrt EP lives in the same `libonnxruntime.so` as :cuda
+    # (the gpu artifact); :tensorrt is just a different ORT-side EP-append
+    # call. Use :cuda for the artifact-resolution path so libpath finds
+    # the gpu lib + libonnxruntime_providers_tensorrt.so (which itself
+    # dlopens libnvinfer.so.10 from LD_LIBRARY_PATH — pip-installed
+    # tensorrt-cu12 wheel ships it under
+    # .pixi/envs/cam/lib/python3.12/site-packages/tensorrt_libs/).
+    artifact_provider = execution_provider === :tensorrt ? :cuda : execution_provider
+    api = ORT.CAPI.GetApi(; execution_provider=artifact_provider)
     env = ORT.CAPI.CreateEnv(api; name=envname, logging_level=ORT.CAPI.ORT_LOGGING_LEVEL_WARNING)
     session_options = ORT.CAPI.CreateSessionOptions(api)
 
@@ -418,6 +525,20 @@ function load_inference_perf(
     _set_graph_optimization_level!(api, session_options, graph_optimization_level)
 
     if execution_provider === :cuda
+        cuda_options = ORT.CAPI.OrtCUDAProviderOptions()
+        ORT.CAPI.SessionOptionsAppendExecutionProvider_CUDA(api, session_options, cuda_options)
+    elseif execution_provider === :tensorrt
+        # TRT EP first; CUDA EP after as fallback for any subgraph TRT
+        # can't take. Without the CUDA fallback, unsupported ops hit the
+        # CPU EP and introduce host↔device copies similar to T1.1's old
+        # Memcpy nodes. Engine cache: TRT JIT-compiles a TensorRT engine
+        # on first session load (slow — seconds to minutes); persisting
+        # it lets subsequent sessions reuse the engine instantly.
+        trt_opts, _gchandle = _make_trt_options(
+            fp16=trt_fp16,
+            engine_cache_path=trt_engine_cache_path,
+        )
+        _append_tensorrt_provider!(api, session_options, trt_opts)
         cuda_options = ORT.CAPI.OrtCUDAProviderOptions()
         ORT.CAPI.SessionOptionsAppendExecutionProvider_CUDA(api, session_options, cuda_options)
     elseif execution_provider !== :cpu
@@ -436,7 +557,13 @@ function load_inference_perf(
     @assert allunique(in_names)
     @assert allunique(out_names)
 
-    return ORT.InferenceSession(api, execution_provider, session, meminfo, allocator, in_names, out_names)
+    # Record the InferenceSession as :cuda so any high-level
+    # ONNXRunTime.jl path (we don't currently use it, but the session
+    # struct's `execution_provider` is checked by
+    # `(::InferenceSession)(inputs)`) accepts it. Our fast-path bypasses
+    # that check anyway.
+    sess_provider = execution_provider === :tensorrt ? :cuda : execution_provider
+    return ORT.InferenceSession(api, sess_provider, session, meminfo, allocator, in_names, out_names)
 end
 
 """
