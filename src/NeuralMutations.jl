@@ -346,6 +346,13 @@ function load_model(options::AbstractOptions)
     if device_str == "cuda" || device_str == "tensorrt"
         if CUDA_IMPORTED[] && CUDA.functional()
             @info "CUDA available. Loading model on GPU ($(device_str))."
+        elseif get(ENV, "SR_TRUST_GPU", "0") == "1"
+            # Escape hatch for envs where Julia CUDA.jl can't load (e.g. the
+            # MIT SuperCloud V100 stack: CUDA.jl 5.2 + GPUCompiler 0.25 is
+            # broken on Julia 1.11). The :cuda / :tensorrt EPs are pure
+            # ORT C-API and do not require Julia CUDA.jl. Caller asserts a
+            # GPU is present; CreateSession will throw if it isn't.
+            @info "SR_TRUST_GPU=1 set; loading $(device_str) EP without Julia CUDA.jl validation."
         else
             @warn "CUDA package not available. Falling back to CPU."
             options.neural_options.device = "cpu"
