@@ -28,10 +28,19 @@ const CFG_REF = Ref{Any}(nothing)
 const OP_INDEX_REF = Ref{Dict{String,Int}}(Dict{String,Int}())
 const OP_TO_LOGITS_REF = Ref{Dict{Tuple{Int,Int}, Int}}(Dict{Tuple{Int,Int}, Int}())
 const OPTIONS_REF = Ref{Union{Nothing, AbstractOptions}}(nothing)
+# PySR builds a fresh `Options` per `fit()`, so identity-comparing `OPTIONS_REF`
+# reloaded the ONNX session on every equation. Cache on the fields the session
+# actually depends on instead.
+const MODEL_LOAD_KEY_REF = Ref{Any}(nothing)
 const ENABLED_REF = Ref{Bool}(false)
 const STATS_LOCK = ReentrantLock()
 const EVAL_X_UNIVARIATE_REF = Ref{Union{Nothing, Matrix}}(nothing)
 const EVAL_TRANSFORM_REF = Ref{Function}(identity)
+
+function _model_load_key(options::AbstractOptions)
+    n = options.neural_options
+    return (n.model_path, n.device, get(ENV, "SR_TRT_FP16", "0"))
+end
 
 zero_sqrt(x) = x >= 0 ? sqrt(x) : zero(x)
 
@@ -247,8 +256,12 @@ function setup_module(options::AbstractOptions)
         ENABLED_REF[] = false
         return
     end
-    @info "Initializing sampling model."
-    load_model(options)
+    load_key = _model_load_key(options)
+    if MODEL_REF[] === nothing || MODEL_LOAD_KEY_REF[] != load_key
+        @info "Initializing sampling model."
+        load_model(options)
+        MODEL_LOAD_KEY_REF[] = load_key
+    end
 
     # nn_config and supported operators are NN-specific and cannot be changed for now. TODO: Infer this from model 
     # (no need to specify as it only works if it agrees with model anyways)
