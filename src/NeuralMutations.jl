@@ -34,6 +34,16 @@ const OPTIONS_REF = Ref{Union{Nothing, AbstractOptions}}(nothing)
 const MODEL_LOAD_KEY_REF = Ref{Any}(nothing)
 const ENABLED_REF = Ref{Bool}(false)
 const STATS_LOCK = ReentrantLock()
+# Serializes ORT `Run` calls into the single shared `_FAST_STATE` (input
+# buffers + output OrtValue Ref) when SR.jl runs the iteration loop with
+# `parallelism=multithreading`. Without it, concurrent threads racing over
+# `state.input_syntax_buf` and `state.output_ortvalue_ref[]` produced
+# observable hangs on MIT V100 (ORT 1.15.1 + TRT 8.6) — zero tfevents
+# growth at eq0 — and is theoretically a correctness bug on cam/nersc
+# (ORT 1.20 + TRT 10) too, just not deadlock-prone there. Cost is small:
+# only the ~ms-scale neural-mutation slice serializes; the rest of the
+# population evolution still parallelizes.
+const INFERENCE_LOCK = ReentrantLock()
 const EVAL_X_UNIVARIATE_REF = Ref{Union{Nothing, Matrix}}(nothing)
 const EVAL_TRANSFORM_REF = Ref{Function}(identity)
 
@@ -743,34 +753,46 @@ function sample_logits(x::AbstractArray{Float32}, eps::Float64=0.01, sample_coun
     state = _FAST_STATE[]
     @assert state !== nothing "Fast inference state not initialised — call load_model first."
 
-    # Write input_syntax into the persistent buffer in ORT row-major layout.
-    # `vec(reversedims(reshape(x, (1, ...))))` is what the high-level path
-    # used to produce; we replicate it in place. `permutedims!` writes into
-    # the destination buffer without an intermediate alloc.
-    x3d = reshape(x, (1, size(x)...))
-    permutedims!(reshape(state.input_syntax_buf, (12, 15, 1)), x3d, (3, 2, 1))
+    # See INFERENCE_LOCK definition at the top of the file. Lock-then-copy: we
+    # hold the lock while writing the persistent inputs and triggering ORT.Run
+    # so the read of the resulting OrtValue (zero-copy view) returned to the
+    # caller cannot race against the next thread's `state.output_ortvalue_ref[]
+    # = nothing` drop. The caller's downstream consumers in `sample_routine`
+    # iterate over `@view`s into the *batch* after the call returns; that's
+    # safe because we move the `output_ortvalue_ref[]` assignment under the
+    # lock and only release after `unsafe_GetTensorMutableData` returns a
+    # PermutedDimsArray whose backing storage is kept alive by ORT until the
+    # NEXT call replaces the ref. The wrapper itself is per-call-stable.
+    return lock(INFERENCE_LOCK) do
+        # Write input_syntax into the persistent buffer in ORT row-major layout.
+        # `vec(reversedims(reshape(x, (1, ...))))` is what the high-level path
+        # used to produce; we replicate it in place. `permutedims!` writes into
+        # the destination buffer without an intermediate alloc.
+        x3d = reshape(x, (1, size(x)...))
+        permutedims!(reshape(state.input_syntax_buf, (12, 15, 1)), x3d, (3, 2, 1))
 
-    if _MODEL_HAS_SAMPLE_COUNT[]
-        state.sample_eps_f64_buf[1] = eps
-        state.sample_count_buf[1] = sample_count
-    else
-        state.sample_eps_f32_buf[1] = Float32(eps)
-        # sample_count is baked into the graph; the caller's value is implicit.
+        if _MODEL_HAS_SAMPLE_COUNT[]
+            state.sample_eps_f64_buf[1] = eps
+            state.sample_count_buf[1] = sample_count
+        else
+            state.sample_eps_f32_buf[1] = Float32(eps)
+            # sample_count is baked into the graph; the caller's value is implicit.
+        end
+
+        # Drop the previous batch's OrtValue *before* triggering the next Run so
+        # ORT can reuse its internal buffer pool. Safe: by contract, all `@view`
+        # slices into the previous batch were consumed before this call (see
+        # `sample_routine`).
+        state.output_ortvalue_ref[] = nothing
+
+        out = _run_with_persistent_inputs!(state)
+        state.output_ortvalue_ref[] = out
+
+        # Zero-copy view into the ORT-owned buffer. Same `PermutedDimsArray{...}`
+        # wrapper shape as the high-level `make_output` path returned, so the
+        # decode/novelty hot path doesn't change.
+        ORT.CAPI.unsafe_GetTensorMutableData(state.api, out)
     end
-
-    # Drop the previous batch's OrtValue *before* triggering the next Run so
-    # ORT can reuse its internal buffer pool. Safe: by contract, all `@view`
-    # slices into the previous batch were consumed before this call (see
-    # `sample_routine`).
-    state.output_ortvalue_ref[] = nothing
-
-    out = _run_with_persistent_inputs!(state)
-    state.output_ortvalue_ref[] = out
-
-    # Zero-copy view into the ORT-owned buffer. Same `PermutedDimsArray{...}`
-    # wrapper shape as the high-level `make_output` path returned, so the
-    # decode/novelty hot path doesn't change.
-    return ORT.CAPI.unsafe_GetTensorMutableData(state.api, out)
 end
 
 """
